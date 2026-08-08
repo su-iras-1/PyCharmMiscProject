@@ -12,9 +12,9 @@ import torch.optim as optim       # 优化器（Adam）
 import random                     # Python 随机库，用于随机采样
 from collections import deque     # 双端队列，用于高效实现实时数据包队列和经验池
 from itertools import combinations # 生成所有组合动作（C(12,4)）
-#import os                         # 操作系统接口（未使用，但可保留）
+import os                         # 操作系统接口（未使用，但可保留）
 import pickle                     # 序列化，用于保存训练数据
-#import sys                        # 系统相关，用于异常捕获
+import sys                        # 系统相关，用于异常捕获
 
 # ========================== 固定随机种子 ==========================
 # 为了实验可复现，固定所有随机数生成器的种子
