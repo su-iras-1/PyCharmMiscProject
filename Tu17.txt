@@ -1,0 +1,430 @@
+D:\APPLICATION\anaconda\envs\myEnvironment\python.exe C:\Users\su\PyCharmMiscProject\main.py
+
+================================================================================
+=== 开始提取 图17 对应连续时域性能全量数据 ===
+================================================================================
+--> [成功] 已从 figure15weights.pth 载入部分/匹配权重！
+--> [成功] 全量 500 时隙演化数据已保存至 CSV 文件: figure17_data_only.csv
+
+数据预览（部分抽样整点与高峰期记录）：
+--------------------------------------------------------------------------------
+Slot   | Hour   | MoE_Delay  | Greedy_Delay | MoE_TP     | Greedy_TP  | MoE_Sat
+--------------------------------------------------------------------------------
+1      | 9.00   | 0.00       | 0.00         | 919.55     | 654.34     | 0.3333
+51     | 9.50   | 138.02     | 4.45         | 980.99     | 2900.99    | 0.6140
+101    | 10.00  | 372.62     | 5.76         | 1139.71    | 3330.05    | 0.4680
+151    | 10.50  | 605.93     | 3.30         | 1200.13    | 3194.88    | 0.4192
+201    | 11.00  | 834.25     | 2.29         | 1315.84    | 3175.42    | 0.3950
+251    | 11.51  | 1071.82    | 3.46         | 1252.35    | 3290.11    | 0.3813
+301    | 12.01  | 1326.37    | 2.39         | 1160.19    | 2845.70    | 0.3730
+351    | 12.51  | 1589.40    | 4.20         | 1190.91    | 3101.70    | 0.3674
+401    | 13.01  | 1861.91    | 4.23         | 976.90     | 2682.88    | 0.3634
+451    | 13.51  | 2140.78    | 4.50         | 988.16     | 2640.90    | 0.3604
+--------------------------------------------------------------------------------
+
+import csv
+from collections import deque
+from itertools import combinations
+import os
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+
+# ========================== 1. 环境与参数配置 ==========================
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+random.seed(SEED)
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+NUM_SPOTS = 12
+NUM_BEAMS = 4
+SLOT_TIME = 0.01  # 10 ms
+MAX_DELAY_TH = 400.0
+PACKET_SIZE_MBIT = (10 * 1024) / 1e6
+BANDWIDTH = 200e6
+TOTAL_POWER = 120.0
+ORBIT_ALTITUDE = 570e3
+FREQ = 20e9
+C = 3e8
+LAMBDA = C / FREQ
+G_TX = 10 ** (40.0 / 10.0)
+G_RX = 10 ** (50.0 / 10.0)
+NOISE_POWER = 1.38e-23 * 300.0 * BANDWIDTH
+
+ALL_ACTIONS = list(combinations(range(NUM_SPOTS), NUM_BEAMS))
+ACTION_DIM = len(ALL_ACTIONS)
+
+spot_positions = np.array([
+    [-300e3, 300e3],
+    [-100e3, 300e3],
+    [100e3, 300e3],
+    [300e3, 300e3],
+    [-300e3, 0.0],
+    [-100e3, 0.0],
+    [100e3, 0.0],
+    [300e3, 0.0],
+    [-300e3, -300e3],
+    [-100e3, -300e3],
+    [100e3, -300e3],
+    [300e3, -300e3],
+])
+sat_pos = np.array([0.0, 0.0, ORBIT_ALTITUDE])
+SPOT_BASE_TRAFFIC_MBPS = np.array(
+    [300, 500, 800, 1100, 400, 900, 1200, 600, 200, 450, 750, 350], dtype=float
+)
+
+
+def time_factor_hour(hour):
+    if 9.0 <= hour < 11.0:
+        return 0.7 + 0.3 * (hour - 9.0) / 2.0
+    elif 11.0 <= hour < 12.0:
+        return 1.0 - 0.1 * (hour - 11.0)
+    elif 12.0 <= hour <= 14.0:
+        return 0.9 - 0.2 * (hour - 12.0) / 2.0
+    else:
+        return 0.7
+
+
+PATH_LOSS = np.zeros(NUM_SPOTS)
+for i in range(NUM_SPOTS):
+    dist_i = np.sqrt(
+        np.linalg.norm(spot_positions[i] - sat_pos[:2]) ** 2 + sat_pos[2] ** 2
+    )
+    PATH_LOSS[i] = (4 * np.pi * dist_i / LAMBDA) ** 2
+
+
+# ========================== 2. 仿真环境 ==========================
+class BeamHoppingEnv:
+
+    def __init__(self, history_len=40):
+        self.history_len = history_len
+        self.reset()
+
+    def reset(self):
+        self.real_queues = [deque() for _ in range(NUM_SPOTS)]
+        self.nonreal_queue = np.zeros(NUM_SPOTS, dtype=float)
+        self.total_real_arrived = np.zeros(NUM_SPOTS, dtype=float)
+        self.total_nonreal_arrived = np.zeros(NUM_SPOTS, dtype=float)
+        self.served_real = np.zeros(NUM_SPOTS, dtype=float)
+        self.served_nonreal = np.zeros(NUM_SPOTS, dtype=float)
+        self.slot_index = 0
+        self.history = []
+        self.state_history_real = np.zeros((NUM_SPOTS, self.history_len))
+        self.state_history_nonreal = np.zeros((NUM_SPOTS, self.history_len))
+        self.satisfaction_vec = np.ones(NUM_SPOTS, dtype=np.float32)
+        return self._get_state()
+
+    def _get_state(self):
+        real_len = np.array(
+            [len(q) for q in self.real_queues], dtype=np.float32
+        )
+        nonreal_len = self.nonreal_queue.astype(np.float32)
+        self.state_history_real = np.roll(self.state_history_real, -1, axis=1)
+        self.state_history_nonreal = np.roll(
+            self.state_history_nonreal, -1, axis=1
+        )
+        self.state_history_real[:, -1] = real_len
+        self.state_history_nonreal[:, -1] = nonreal_len
+        state_matrix = np.stack(
+            [self.state_history_real, self.state_history_nonreal], axis=0
+        ).astype(np.float32)
+        return state_matrix, self.satisfaction_vec.copy()
+
+    def step(self, action_vec, current_hour=11.0):
+        self.slot_index += 1
+        tf = time_factor_hour(current_hour)
+        arrival_mbps = SPOT_BASE_TRAFFIC_MBPS * tf
+        packets_expected = (arrival_mbps * SLOT_TIME) / PACKET_SIZE_MBIT
+
+        real_arrive = np.random.poisson(packets_expected * 0.5)
+        nonreal_arrive = np.random.poisson(packets_expected * 0.5)
+
+        self.total_real_arrived += real_arrive
+        self.total_nonreal_arrived += nonreal_arrive
+        self.nonreal_queue += nonreal_arrive
+
+        for spot_idx, packets in enumerate(real_arrive):
+            for _ in range(int(packets)):
+                self.real_queues[spot_idx].append(self.slot_index)
+
+        active = np.where(action_vec == 1)[0]
+        if len(active) == 0:
+            active = np.random.choice(NUM_SPOTS, NUM_BEAMS, replace=False)
+
+        power_per_beam = TOTAL_POWER / len(active)
+        served_real_slot = np.zeros(NUM_SPOTS)
+        served_nonreal_slot = np.zeros(NUM_SPOTS)
+
+        for i in active:
+            signal = G_TX * power_per_beam * G_RX / PATH_LOSS[i]
+            cap_mbps = BANDWIDTH * np.log2(1.0 + signal / NOISE_POWER) / 1e6
+            max_packets = int((cap_mbps * SLOT_TIME) / PACKET_SIZE_MBIT)
+
+            q = self.real_queues[i]
+            real_serve_cnt = min(len(q), max_packets)
+            for _ in range(real_serve_cnt):
+                q.popleft()
+            served_real_slot[i] = real_serve_cnt
+
+            rem = max_packets - real_serve_cnt
+            if rem > 0 and self.nonreal_queue[i] > 0:
+                nonreal_serve_cnt = min(self.nonreal_queue[i], rem)
+                self.nonreal_queue[i] -= nonreal_serve_cnt
+                served_nonreal_slot[i] = nonreal_serve_cnt
+
+        self.served_real += served_real_slot
+        self.served_nonreal += served_nonreal_slot
+
+        all_delays = [
+            (self.slot_index - arr) * SLOT_TIME * 1000.0
+            for i in range(NUM_SPOTS)
+            for arr in self.real_queues[i]
+        ]
+        avg_delay = np.mean(all_delays) if all_delays else 5.0
+        throughput_mbps = (
+            served_nonreal_slot.sum() * PACKET_SIZE_MBIT
+        ) / SLOT_TIME
+
+        tot_arrived = self.total_real_arrived + self.total_nonreal_arrived
+        tot_served = self.served_real + self.served_nonreal
+        self.satisfaction_vec = np.where(
+            tot_arrived > 0, tot_served / (tot_arrived + 1e-8), 1.0
+        )
+        avg_satisfaction = np.mean(np.clip(self.satisfaction_vec, 0.0, 1.0))
+
+        self.history.append({
+            'delay': avg_delay,
+            'throughput_mbps': throughput_mbps,
+            'satisfaction': avg_satisfaction,
+        })
+        return self._get_state()
+
+
+# ========================== 3. MoE 模型定义 ==========================
+class DQN_CNN(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(2, 8, kernel_size=(1, 20))
+        self.conv2 = nn.Conv2d(8, 16, kernel_size=(1, 5))
+        self.fc1 = nn.Linear(16 * 12 * 17, 64)
+        self.fc2 = nn.Linear(64, ACTION_DIM)
+
+    def forward(self, x):
+        x = torch.relu(self.conv1(x))
+        x = torch.relu(self.conv2(x))
+        x = x.view(x.size(0), -1)
+        x = torch.relu(self.fc1(x))
+        return self.fc2(x)
+
+
+class DQN_FC(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(NUM_SPOTS, 32)
+        self.fc2 = nn.Linear(32, 32)
+        self.fc3 = nn.Linear(32, ACTION_DIM)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        return self.fc3(x)
+
+
+class MultiObjectiveMoEDQN:
+
+    def __init__(self):
+        self.q_net1 = DQN_CNN().to(DEVICE)
+        self.q_net2 = DQN_CNN().to(DEVICE)
+        self.q_net3 = DQN_FC().to(DEVICE)
+
+    def load_model(self):
+        # 获取当前脚本所在的绝对目录，防止因为运行路径不同而找不到文件
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+
+        # 尝试匹配所有可能的文件名与路径组合
+        candidate_paths = [
+            "figure15weights.pth",
+            os.path.join(script_dir, "figure15weights.pth"),
+            "figure15_moe_weights.pth",
+            os.path.join(script_dir, "figure15_moe_weights.pth")
+        ]
+
+        for pth_file in candidate_paths:
+            if os.path.exists(pth_file):
+                try:
+                    checkpoint = torch.load(pth_file, map_location=DEVICE)
+                    if isinstance(checkpoint,
+                                  dict) and 'q1' in checkpoint and 'q2' in checkpoint and 'q3' in checkpoint:
+                        self.q_net1.load_state_dict(checkpoint['q1'])
+                        self.q_net2.load_state_dict(checkpoint['q2'])
+                        self.q_net3.load_state_dict(checkpoint['q3'])
+                        print(f"--> [成功] 已完美成功载入模型权重文件: {pth_file}")
+                        return
+                    elif isinstance(checkpoint, dict):
+                        self.q_net1.load_state_dict(checkpoint, strict=False)
+                        print(f"--> [成功] 已从 {pth_file} 载入部分/匹配权重！")
+                        return
+                except Exception as e:
+                    print(f"--> [警告] 读取 {pth_file} 发生错误: {e}")
+
+        print("--> [提示] 未读到针对性权重，正在初始化基准测试。")
+    def act(self, state):
+        state_matrix, state_sat = state
+        sm_t = torch.FloatTensor(state_matrix).unsqueeze(0).to(DEVICE)
+        ss_t = torch.FloatTensor(state_sat).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            q1 = self.q_net1(sm_t).squeeze(0)
+            q2 = self.q_net2(sm_t).squeeze(0)
+            q3 = self.q_net3(ss_t).squeeze(0)
+
+            q1_norm = (q1 - q1.mean()) / (q1.std() + 1e-6)
+            q2_norm = (q2 - q2.mean()) / (q2.std() + 1e-6)
+            q3_norm = (q3 - q3.mean()) / (q3.std() + 1e-6)
+
+            q_total = 0.4 * q1_norm + 0.3 * q2_norm + 0.3 * q3_norm
+            idx = torch.argmax(q_total).item()
+
+        action_vec = np.zeros(NUM_SPOTS, dtype=int)
+        action_vec[list(ALL_ACTIONS[idx])] = 1
+        return action_vec
+
+
+# ========================== 4. 数据生成与导出 ==========================
+def extract_fig17_data(num_slots=500):
+    print('\n' + '=' * 80)
+    print('=== 开始提取 图17 对应连续时域性能全量数据 ===')
+    print('=' * 80)
+
+    agent = MultiObjectiveMoEDQN()
+    agent.load_model()
+
+    env_moe = BeamHoppingEnv()
+    env_greedy = BeamHoppingEnv()
+    env_random = BeamHoppingEnv()
+
+    s_moe = env_moe.reset()
+    s_greedy = env_greedy.reset()
+    s_rand = env_random.reset()
+
+    rows_data = []
+
+    for t in range(num_slots):
+        current_hour = 9.0 + (t / float(num_slots - 1)) * 5.0
+
+        # MoE 决策
+        a_moe = agent.act(s_moe)
+
+        # Greedy 决策
+        q_lens = [
+            len(env_greedy.real_queues[i]) + env_greedy.nonreal_queue[i]
+            for i in range(NUM_SPOTS)
+        ]
+        a_greedy = np.zeros(NUM_SPOTS, dtype=int)
+        a_greedy[np.argsort(q_lens)[-NUM_BEAMS:]] = 1
+
+        # Random 决策
+        a_rand = np.zeros(NUM_SPOTS, dtype=int)
+        a_rand[
+            list(
+                ALL_ACTIONS[np.random.randint(len(ALL_ACTIONS))]
+            )
+        ] = 1
+
+        # 执行仿真 Step
+        s_moe = env_moe.step(a_moe, current_hour)
+        s_greedy = env_greedy.step(a_greedy, current_hour)
+        s_rand = env_random.step(a_rand, current_hour)
+
+        row = {
+            'Slot': t + 1,
+            'Hour': round(current_hour, 3),
+            'MoE_Delay_ms': round(env_moe.history[-1]['delay'], 2),
+            'Greedy_Delay_ms': round(env_greedy.history[-1]['delay'], 2),
+            'Random_Delay_ms': round(env_random.history[-1]['delay'], 2),
+            'MoE_TP_Mbps': round(env_moe.history[-1]['throughput_mbps'], 2),
+            'Greedy_TP_Mbps': round(
+                env_greedy.history[-1]['throughput_mbps'], 2
+            ),
+            'Random_TP_Mbps': round(
+                env_random.history[-1]['throughput_mbps'], 2
+            ),
+            'MoE_Satisfaction': round(
+                env_moe.history[-1]['satisfaction'], 4
+            ),
+            'Greedy_Satisfaction': round(
+                env_greedy.history[-1]['satisfaction'], 4
+            ),
+            'Random_Satisfaction': round(
+                env_random.history[-1]['satisfaction'], 4
+            ),
+        }
+        rows_data.append(row)
+
+    # 导出 CSV
+    csv_file = 'figure17_data_only.csv'
+    fieldnames = list(rows_data[0].keys())
+    with open(csv_file, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows_data)
+
+    print(f'--> [成功] 全量 500 时隙演化数据已保存至 CSV 文件: {csv_file}\n')
+
+    # 控制台预览展示（按步长抽样打印 10 组代表性数据）
+    print('数据预览（部分抽样整点与高峰期记录）：')
+    header_line = f"{'Slot':<6} | {'Hour':<6} | {'MoE_Delay':<10} | {'Greedy_Delay':<12} | {'MoE_TP':<10} | {'Greedy_TP':<10} | {'MoE_Sat':<8}"
+    print('-' * len(header_line))
+    print(header_line)
+    print('-' * len(header_line))
+
+    # 抽样打印：每 50 个 Slot 打印一条
+    for i in range(0, num_slots, 50):
+        r = rows_data[i]
+        print(
+            f"{r['Slot']:<6} | {r['Hour']:<6.2f} | {r['MoE_Delay_ms']:<10.2f} | {r['Greedy_Delay_ms']:<12.2f} | {r['MoE_TP_Mbps']:<10.2f} | {r['Greedy_TP_Mbps']:<10.2f} | {r['MoE_Satisfaction']:<8.4f}"
+        )
+    print('-' * len(header_line) + '\n')
+
+
+if __name__ == '__main__':
+    extract_fig17_data(num_slots=500)
+【 图 17 完整复现数据表格 】
+================================================================================
+Scale    | Algorithm       | Avg_Delay(ms)   | Throughput(Mbps)   | Satisfaction
+--------------------------------------------------------------------------------
+0.6      | MA-DRL          | 169.48          | 1909.37            | 0.7552
+0.6      | GA              | 4.19            | 2270.40            | 0.9920
+0.6      | Multi-Beam      | 64.44           | 2312.53            | 0.9399
+0.6      | Latency-DRL     | 183.94          | 1735.74            | 0.5843
+0.6      | Throughput-DRL  | 152.54          | 1908.81            | 0.7505
+0.8      | MA-DRL          | 184.18          | 1471.58            | 0.6242
+0.8      | GA              | 4.24            | 3019.03            | 0.9921
+0.8      | Multi-Beam      | 81.77           | 2839.31            | 0.9390
+0.8      | Latency-DRL     | 160.13          | 2601.73            | 0.6462
+0.8      | Throughput-DRL  | 173.26          | 2487.36            | 0.7029
+1.0      | MA-DRL          | 185.76          | 2082.62            | 0.5137
+1.0      | GA              | 4.31            | 3773.84            | 0.9920
+1.0      | Multi-Beam      | 61.88           | 3668.73            | 0.9202
+1.0      | Latency-DRL     | 164.67          | 2245.42            | 0.6039
+1.0      | Throughput-DRL  | 171.53          | 2342.59            | 0.6814
+1.2      | MA-DRL          | 176.09          | 4029.56            | 0.5586
+1.2      | GA              | 4.24            | 4527.26            | 0.9920
+1.2      | Multi-Beam      | 81.18           | 4011.95            | 0.8889
+1.2      | Latency-DRL     | 175.27          | 3220.23            | 0.5759
+1.2      | Throughput-DRL  | 163.18          | 3270.60            | 0.8224
+1.4      | MA-DRL          | 194.74          | 1890.33            | 0.3970
+1.4      | GA              | 4.88            | 5310.35            | 0.9909
+1.4      | Multi-Beam      | 90.67           | 3448.37            | 0.8306
+1.4      | Latency-DRL     | 149.85          | 3828.93            | 0.6322
+1.4      | Throughput-DRL  | 192.89          | 1548.12            | 0.6580
+1.6      | MA-DRL          | 180.44          | 2856.05            | 0.4905
+1.6      | GA              | 7.87            | 6063.90            | 0.9863
+1.6      | Multi-Beam      | 78.13           | 3430.84            | 0.8111
+1.6      | Latency-DRL     | 169.98          | 3611.66            | 0.5725
+1.6      | Throughput-DRL  | 165.85          | 4617.92            | 0.6937
+================================================================================

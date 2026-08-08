@@ -279,7 +279,7 @@ class BeamHoppingEnv:
                 all_delays.append(
                     (self.slot_index - arr) * SLOT_TIME * 1000.0
                 )
-        avg_delay = np.mean(all_delays) if all_delays else 0.0
+        avg_delay = np.mean(all_delays) if all_delays else 5.0
 
         throughput_mbps = (
             served_nonreal_slot.sum() * PACKET_SIZE_MBIT
@@ -293,7 +293,6 @@ class BeamHoppingEnv:
         self.satisfaction_vec = np.clip(self.satisfaction_vec, 0.0, 1.0)
         avg_satisfaction = np.mean(self.satisfaction_vec)
 
-        # 多目标解耦奖励
         r_delay = -min(avg_delay / 100.0, 3.0) - (dropped_packets * 0.1)
         r_tp = np.log1p(throughput_mbps / 1000.0)
         r_sat = avg_satisfaction * 1.5
@@ -393,6 +392,32 @@ class MultiObjectiveMoEDQN:
             self.target_net2.load_state_dict(self.q_net2.state_dict())
             self.target_net3.load_state_dict(self.q_net3.state_dict())
 
+    # ==================== [新增/修改]: 导出与加载 .pth 权重 ====================
+    def save_model(self, path_prefix="moe_dqn"):
+        """导出三个专家的 Q 网络权重为 .pth 文件"""
+        torch.save(self.q_net1.state_dict(), f"{path_prefix}_q1.pth")
+        torch.save(self.q_net2.state_dict(), f"{path_prefix}_q2.pth")
+        torch.save(self.q_net3.state_dict(), f"{path_prefix}_q3.pth")
+        print(
+            f"--> 模型权重已成功导出至: {path_prefix}_q1.pth, {path_prefix}_q2.pth, {path_prefix}_q3.pth"
+        )
+
+    def load_model(self, path_prefix="moe_dqn"):
+        """从 .pth 文件加载已训练好的权重"""
+        self.q_net1.load_state_dict(
+            torch.load(f"{path_prefix}_q1.pth", map_location=DEVICE)
+        )
+        self.q_net2.load_state_dict(
+            torch.load(f"{path_prefix}_q2.pth", map_location=DEVICE)
+        )
+        self.q_net3.load_state_dict(
+            torch.load(f"{path_prefix}_q3.pth", map_location=DEVICE)
+        )
+        self.update_target(tau=1.0)
+        print(f"--> 成功从 {path_prefix}_*.pth 加载模型权重！")
+
+    # =========================================================================
+
     def act(self, state, eval_mode=False):
         state_matrix, state_sat = state
 
@@ -407,12 +432,10 @@ class MultiObjectiveMoEDQN:
                 q2 = self.q_net2(sm_t).squeeze(0)
                 q3 = self.q_net3(ss_t).squeeze(0)
 
-                # 使用 Standard Scale (Z-Score) 归一化融合 Q 值
                 q1_norm = (q1 - q1.mean()) / (q1.std() + 1e-6)
                 q2_norm = (q2 - q2.mean()) / (q2.std() + 1e-6)
                 q3_norm = (q3 - q3.mean()) / (q3.std() + 1e-6)
 
-                # 融合决策
                 q_total = 0.4 * q1_norm + 0.3 * q2_norm + 0.3 * q3_norm
                 idx = torch.argmax(q_total).item()
 
@@ -498,34 +521,11 @@ class MultiObjectiveMoEDQN:
             self.epsilon_min, self.epsilon * self.epsilon_decay
         )
 
-    # 保存整套 MoE 专家权重
-    def save_weights(self, filepath="figure15weights.pth"):
-        state_dict_all = {
-            "q1": self.q_net1.state_dict(),
-            "q2": self.q_net2.state_dict(),
-            "q3": self.q_net3.state_dict(),
-        }
-        torch.save(state_dict_all, filepath)
-        print(f"--> [成功导出权重] 已将完整的 MoE 专家网络权重保存至: {filepath}")
 
-    # 加载整套 MoE 专家权重
-    def load_weights(self, filepath="figure15weights.pth"):
-        checkpoint = torch.load(filepath, map_location=DEVICE)
-        if isinstance(checkpoint, dict) and "q1" in checkpoint:
-            self.q_net1.load_state_dict(checkpoint["q1"])
-            self.q_net2.load_state_dict(checkpoint["q2"])
-            self.q_net3.load_state_dict(checkpoint["q3"])
-            print(f"--> [完美精准加载] 成功从 {filepath} 恢复 MoE 全部专家网络！")
-        else:
-            raise KeyError(
-                "权重文件不匹配！缺少 q1, q2, q3 的字典结构，请检查保存方式。"
-            )
-
-
-# ========================== 7. 训练与数据提取流程 ==========================
-def run_simulation():
+# ========================== 7. 训练与模型导出 ==========================
+def run_simulation(model_prefix="moe_dqn_final"):
     print(
-        f"=== 开始运行低轨跳波束资源调度 DRL 训练与数据提取 (使用设备: {DEVICE}) ==="
+        f"=== 开始运行低轨跳波束资源调度 DRL 训练 (使用设备: {DEVICE}) ==="
     )
 
     env = BeamHoppingEnv()
@@ -536,7 +536,9 @@ def run_simulation():
     BATCH_SIZE = 16
     TARGET_UPDATE_STEP = 200
 
-    print("\n--- 1. 模型训练阶段 (图15 演化基线) ---")
+    all_episode_stats = []
+
+    print("\n--- 1. 模型训练阶段 ---")
     step_count = 0
 
     for episode in range(1, LOOPS + 1):
@@ -558,126 +560,85 @@ def run_simulation():
             state = next_state
 
         avg_delay, avg_tp, avg_sat = env.get_period_stats()
+        tuple_data = (
+            round(avg_delay, 2),
+            round(avg_tp, 2),
+            round(avg_sat, 4),
+        )
+        all_episode_stats.append(tuple_data)
         agent.decay_epsilon()
 
         if episode % 50 == 0 or episode == LOOPS:
             print(
-                f"Episode {episode:03d}/{LOOPS}: (平均时延={avg_delay:.2f} ms, 吞吐量={avg_tp:.2f} Mbps, 满意度={avg_sat:.4f})"
+                f"Episode {episode:03d}/{LOOPS}: (平均时延={tuple_data[0]} ms, 吞吐量={tuple_data[1]} Mbps, 满意度={tuple_data[2]})"
             )
 
-    # 满足要求 1：保存全套 MoE 权重至 .pth
-    WEIGHT_PATH = "figure15weights.pth"
-    agent.save_weights(WEIGHT_PATH)
+    # ==================== [步骤二应用]: 保存训练好的 .pth 文件 ====================
+    print("\n=== 保存训练好的模型权重 ===")
+    agent.save_model(path_prefix=model_prefix)
 
-    # 验证权重无缝加载
-    agent.load_weights(WEIGHT_PATH)
 
-    # ========================== 满足要求 2：提取 图 16 整点对比数据 (仅 MoE) ==========================
-    print("\n--- 2. 提取【图 16】整点性能对比数据 (仅 MoE) ---")
-    hours_to_test = [9.0, 10.0, 11.0, 12.0, 13.0, 14.0]
-    fig16_rows = []
+# ========================== 8. 加载 .pth 并导出图 16 测绘数据 ==========================
+def export_fig16_data(model_prefix="moe_dqn_final", num_eval_slots=500):
+    """加载 .pth 模型并在评测环境运行，生成供绘图软件使用的 CSV 数据表"""
+    print(f"\n=== 加载模型 {model_prefix} 并导出图 16 测绘数据 ===")
 
-    for h in hours_to_test:
-        test_env = BeamHoppingEnv()
-        state = test_env.reset()
-        for _ in range(100):  # 热身与稳态演化
-            action_vec, _ = agent.act(state, eval_mode=True)
-            state, _, _, _ = test_env.step(action_vec, current_hour=h)
+    agent = MultiObjectiveMoEDQN()
+    agent.load_model(model_prefix)
 
-        avg_delay, avg_tp, avg_sat = test_env.get_period_stats()
-        hour_str = f"{int(h)}:00"
-        fig16_rows.append(
-            {
-                "Time": hour_str,
-                "Algorithm": "MA-DRL (MoE)",
-                "Avg_Delay(ms)": f"{avg_delay:.2f}",
-                "Throughput(Mbps)": f"{avg_tp:.2f}",
-                "Satisfaction": f"{avg_sat:.4f}",
-            }
-        )
-
-    # 打印图 16 结果
-    print("-" * 75)
-    print(
-        f"{'Time':<8}| {'Algorithm':<20}| {'Avg_Delay(ms)':<15}| {'Throughput(Mbps)':<18}| {'Satisfaction'}"
-    )
-    print("-" * 75)
-    for row in fig16_rows:
-        print(
-            f"{row['Time']:<8}| {row['Algorithm']:<20}| {row['Avg_Delay(ms)']:<15}| {row['Throughput(Mbps)']:<18}| {row['Satisfaction']}"
-        )
-    print("-" * 75)
-
-    # 导出 CSV
-    fig16_csv = "figure16_hourly_moe_data.csv"
-    with open(fig16_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "Time",
-                "Algorithm",
-                "Avg_Delay(ms)",
-                "Throughput(Mbps)",
-                "Satisfaction",
-            ],
-        )
-        writer.writeheader()
-        writer.writerows(fig16_rows)
-    print(f"--> [成功保存] 图16 MoE 整点数据已导出至: {fig16_csv}")
-
-    # ========================== 满足要求 3：提取 图 17 连续 500 时隙演化数据 (仅 MoE) ==========================
-    print("\n--- 3. 提取【图 17】连续 500 时隙演化全量数据 (仅 MoE) ---")
     eval_env = BeamHoppingEnv()
     state = eval_env.reset()
 
-    TOTAL_SLOTS = 500
-    fig17_rows = []
+    fig16_records = []
 
-    for t in range(1, TOTAL_SLOTS + 1):
-        # 9:00 -> 14:00 (跨度 5 小时) 映射到 500 时隙
-        current_hour = 9.0 + (t / TOTAL_SLOTS) * 5.0
-        action_vec, _ = agent.act(state, eval_mode=True)
+    # 纯推理评测阶段 (eval_mode=True 禁用随机探索)
+    for t in range(num_eval_slots):
+        current_hour = 9.0 + (t / float(num_eval_slots)) * 5.0
+        action_vec, action_idx = agent.act(state, eval_mode=True)
         next_state, _, _, _ = eval_env.step(
             action_vec, current_hour=current_hour
         )
 
-        curr_delay = eval_env.history[-1]["delay"]
-        curr_tp = eval_env.history[-1]["throughput_mbps"]
-        curr_sat = eval_env.history[-1]["satisfaction"]
+        slot_delay = eval_env.history[-1]["delay"]
+        slot_tp = eval_env.history[-1]["throughput_mbps"]
+        slot_sat = eval_env.history[-1]["satisfaction"]
 
-        fig17_rows.append(
+        fig16_records.append(
             {
-                "Slot": t,
-                "Hour": f"{current_hour:.2f}",
-                "MoE_Delay": f"{curr_delay:.2f}",
-                "MoE_TP": f"{curr_tp:.2f}",
-                "MoE_Sat": f"{curr_sat:.4f}",
+                "slot": t + 1,
+                "hour": round(current_hour, 2),
+                "delay_ms": round(slot_delay, 4),
+                "throughput_mbps": round(slot_tp, 4),
+                "satisfaction": round(slot_sat, 4),
             }
         )
+
         state = next_state
 
-    # 打印每 50 步采样预览
-    print("-" * 65)
-    print(
-        f"{'Slot':<8}| {'Hour':<8}| {'MoE_Delay(ms)':<15}| {'MoE_TP(Mbps)':<15}| {'MoE_Sat'}"
-    )
-    print("-" * 65)
-    for row in fig17_rows[::50]:
-        print(
-            f"{row['Slot']:<8}| {row['Hour']:<8}| {row['MoE_Delay']:<15}| {row['MoE_TP']:<15}| {row['MoE_Sat']}"
-        )
-    print("-" * 65)
-
-    # 导出 CSV
-    fig17_csv = "figure17_continuous_moe_data.csv"
-    with open(fig17_csv, "w", newline="", encoding="utf-8") as f:
+    # 导出为 CSV 文件
+    csv_filename = "figure16_reproduction_data.csv"
+    with open(csv_filename, mode="w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
-            f, fieldnames=["Slot", "Hour", "MoE_Delay", "MoE_TP", "MoE_Sat"]
+            f,
+            fieldnames=[
+                "slot",
+                "hour",
+                "delay_ms",
+                "throughput_mbps",
+                "satisfaction",
+            ],
         )
         writer.writeheader()
-        writer.writerows(fig17_rows)
-    print(f"--> [成功保存] 图17 MoE 连续演化数据已导出至: {fig17_csv}")
+        writer.writerows(fig16_records)
+
+    print(f"--> 图 16 数据集已成功导出至: {csv_filename}")
 
 
-if __name__ == "__main__":
-    run_simulation()
+if __name__ == "__Tu15_16savePth__":
+    MODEL_PREFIX = "moe_dqn_final"
+
+    # 1. 运行训练并自动保存 .pth 文件
+    run_simulation(model_prefix=MODEL_PREFIX)
+
+    # 2. 读取导出的 .pth 模型进行测试并导出 CSV 表格
+    export_fig16_data(model_prefix=MODEL_PREFIX, num_eval_slots=500)

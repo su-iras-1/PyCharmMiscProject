@@ -1,610 +1,467 @@
-# =====================================================================
-# 基于多智能体深度强化学习的低轨星座跳波束资源调度
-# 论文复现代码 - 完整注释版
-# 所有参数与模型设计严格遵循论文表1、表2及公式(1)-(35)
-# =====================================================================
-
-# 导入必要的库
-import numpy as np                # 数值计算，用于数组、随机数、线性代数等
-import torch                      # PyTorch 深度学习框架
-import torch.nn as nn             # 神经网络模块
-import torch.optim as optim       # 优化器（Adam）
-import random                     # Python 随机库，用于随机采样
-from collections import deque     # 双端队列，用于高效实现实时数据包队列和经验池
-from itertools import combinations # 生成所有组合动作（C(12,4)）
-#import os                         # 操作系统接口（未使用，但可保留）
-import pickle                     # 序列化，用于保存训练数据
-#import sys                        # 系统相关，用于异常捕获
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import random
+from collections import deque
+from itertools import combinations
 
 # ========================== 固定随机种子 ==========================
-# 为了实验可复现，固定所有随机数生成器的种子
 SEED = 42
-np.random.seed(SEED)              # NumPy 随机种子
-torch.manual_seed(SEED)           # PyTorch CPU 随机种子
-random.seed(SEED)                 # Python 内置随机种子
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(SEED)  # 如果使用 GPU，也固定种子
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+random.seed(SEED)
 
-# ========================== 系统参数（论文表1） ==========================
-# 这些参数定义了低轨卫星跳波束系统的物理层和 MAC 层配置
-NUM_SPOTS = 12                    # 地面波位（波位）总数 N，对应论文图5
-NUM_BEAMS = 4                     # 卫星同时激活的波束数 K，表1中“波束数/个”为4
-SLOT_TIME = 0.01                  # 跳波束时隙长度 10ms，表1
-MAX_DELAY = 400                   # 数据包最大排队时延阈值 400ms，表1，超过则丢弃
-PACKET_SIZE = 10 * 1024 * 8       # 数据包大小 10 kbit，转换为 bit (10*1024*8)
-BANDWIDTH = 200e6                 # 单波束带宽 200 MHz，表1，单位 Hz
-TOTAL_POWER = 120                 # 星上总功率 120 W，表1
-MAX_BEAM_POWER = 60               # 单波束最大功率 60 W，表1
-ORBIT_ALTITUDE = 570e3            # 轨道高度 570 km，表1，单位米
-FREQ = 20e9                       # 载波频率 20 GHz，表1
-C = 3e8                           # 光速 3e8 m/s
-LAMBDA = C / FREQ                 # 波长 = 光速/频率
-G_TX = 40                         # 卫星发射天线增益 40 dB，表1（此处转换为线性值？实际后面乘以10000）
-G_RX = 50                         # 用户接收天线增益 50 dB，表1
-# 注意：上述增益在公式中通常以线性值代入，所以后面在计算时会把 dB 转为线性倍数（10^(dB/10)）
-# 这里直接存为 dB 值，使用时再转换，更清晰。但我们为了简化，直接使用线性倍数：
-# 实际上 G_TX_lin = 10^(40/10)=10000, G_RX_lin = 10^(50/10)=100000
-# 下面在计算路径损耗和干扰时直接使用线性增益常数
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-K_B = 1.38e-23                   # 玻尔兹曼常数，表1（-228.6 dBW/K/Hz 转换为线性？）
-TEMP = 300                        # 噪声温度 300 K，表1
-NOISE_POWER = K_B * TEMP * BANDWIDTH  # 噪声功率 N0 = k*T*B，单位 W，公式(7)的分母中
+# ========================== 系统参数（表1 & 表2） ==========================
+NUM_SPOTS = 12             # 波位数
+NUM_BEAMS = 4              # 波束数
+SLOT_TIME = 0.01           # 10 ms
+MAX_DELAY = 400            # ms
+PACKET_SIZE = 10 * 1024    # 10 kbit -> bit
+BANDWIDTH = 200e6          # 200 MHz
+TOTAL_POWER = 120.0        # 120 W
+MAX_BEAM_POWER = 60.0      # 60 W
+ORBIT_ALTITUDE = 570e3     # 570 km
+FREQ = 20e9                # 20 GHz
+C = 3e8
+LAMBDA = C / FREQ
+G_TX = 10 ** (40 / 10)     # 40 dB -> 线性增益 10000
+G_RX = 10 ** (50 / 10)     # 50 dB -> 线性增益 100000
+K_B = 1.38e-23
+TEMP = 300
+NOISE_POWER = K_B * TEMP * BANDWIDTH # 噪声功率 (W)
 
-# 波位位置生成：在覆盖区域内随机分布（论文图5示意，这里模拟）
-COVERAGE_RADIUS = 500e3           # 覆盖半径 500 km，用于模拟波位的地理分布
+# 生成固定波位位置
+COVERAGE_RADIUS = 500e3
 spot_positions = np.random.uniform(-COVERAGE_RADIUS, COVERAGE_RADIUS, (NUM_SPOTS, 2))
-# 生成12个波位的 (x, y) 坐标，单位米，用于计算波位间距离和星地夹角
+sat_pos = np.array([0, 0, ORBIT_ALTITUDE])
 
-# 卫星位置固定在天顶（0,0,轨道高度），实际低轨卫星会移动，但论文在单一时刻建模干扰时采用静态几何
-sat_pos = np.array([0, 0, ORBIT_ALTITUDE])  # 卫星三维坐标
+# 动作空间：C(12, 4) = 495
+ALL_ACTIONS = list(combinations(range(NUM_SPOTS), NUM_BEAMS))
+ACTION_DIM = len(ALL_ACTIONS)
 
-# ========================== 预生成所有组合动作 ==========================
-# 动作空间定义为从12个波位中选择4个进行服务，总共有 C(12,4)=495 种组合
-# 将每个组合映射为一个整数索引，网络输出维度为495
-ALL_ACTIONS = list(combinations(range(NUM_SPOTS), NUM_BEAMS))  # 所有组合的列表
-ACTION_DIM = len(ALL_ACTIONS)      # 动作空间大小 495
-
-# ========================== 业务模型（论文1.4节，图6、图7） ==========================
-# 生成各波位的峰值业务速率（空间分布不均，离散系数 ζ≈0.5）
-mean_traffic = 150                # 平均业务速率 150 Mbps
-std = 75                          # 标准差，使离散系数=0.5 (std/mean=0.5)
-# 使用截断正态分布生成12个波位的峰值速率，限制在 [50, 300] 之间
-raw = np.random.normal(mean_traffic, std, NUM_SPOTS)  # 生成正态分布样本
-spot_means = np.clip(raw, 50, 300)   # 截断，保证合理范围
+# 业务基准参数
+spot_means = np.random.uniform(100, 250, NUM_SPOTS)
 
 def time_factor_hour(hour):
-    """
-    时间加权因子，模拟一天内业务量的变化（论文图7）
-    输入：当前时间（小时，浮点数），例如 9.5 表示 9:30
-    返回：业务量乘数，在波峰时段（10-12点）最高
-    """
-    if 8 <= hour < 10:            # 早间上升段
+    if 8 <= hour < 10:
         return 0.5 + 0.5 * (hour - 8) / 2
-    elif 10 <= hour < 12:         # 上午高峰
+    elif 10 <= hour < 12:
         return 1.0 + 0.2 * (hour - 10)
-    elif 12 <= hour < 14:         # 下午回落
+    elif 12 <= hour < 14:
         return 1.2 - 0.2 * (hour - 12)
-    elif 14 <= hour < 18:         # 平稳期
+    elif 14 <= hour < 18:
         return 1.0
-    else:                         # 夜间低谷
+    else:
         return 0.4
 
-# ========================== 干扰与容量计算（公式2-7） ==========================
-def antenna_gain(theta, theta_3dB=0.2):
-    """
-    计算天线增益（公式3、4）
-    theta: 偏离波束中心的夹角（弧度）
-    theta_3dB: 半功率波束宽度，假设为0.2 rad（约11.5度）
-    返回：线性增益值（峰值归一化为1，再乘以峰值增益10000）
-    """
-    # 使用 numpy 的贝塞尔函数 jv（若无，则尝试 scipy）
+# 预计算天线增益与干扰矩阵
+def  antenna_gain_val(theta, theta_3dB=0.2):
     try:
         from numpy import jv
     except ImportError:
         from scipy.special import jv
-    if theta == 0:                # 避免除零
-        return 1.0 * 10000        # 峰值增益 40dB -> 10000 线性
-    u = 2.07123 * np.sin(theta) / np.sin(theta_3dB)  # 公式(4)
-    J1 = jv(1, u)                 # 一阶贝塞尔函数
-    J3 = jv(3, u)                 # 三阶贝塞尔函数
-    G = (J1 / (2*u) + 36 * J3 / (u**3))**2  # 公式(3)
-    return G * 10000              # 乘以峰值增益
+    if theta == 0:
+        return 1.0
+    u = 2.07123 * np.sin(theta) / np.sin(theta_3dB)
+    J1 = jv(1, u)
+    J3 = jv(3, u)
+    G = (J1 / (2 * u) + 36 * J3 / (u ** 3)) ** 2
+    return G * G_TX
 
-def compute_interference(active_indices, sat_pos, spot_positions, power_allocation):
-    """
-    计算所有激活波束对每个波位的干扰功率和（公式2，含公式5的夹角计算）
-    输入：
-        active_indices: 当前激活的波位索引列表
-        sat_pos: 卫星位置 (3维)
-        spot_positions: 所有波位的 (x,y) 坐标 (12,2)
-        power_allocation: 每个激活波位的发射功率 (W)
-    返回：长度为12的数组，表示每个波位受到的干扰功率 (W)
-    """
-    num_spots = len(spot_positions)
-    interference = np.zeros(num_spots)
-    for i in active_indices:               # 遍历每个干扰源波束
-        P_i = power_allocation[i]          # 该波束发射功率
-        pos_i = spot_positions[i]          # 该波位平面坐标
-        d_i = np.linalg.norm(pos_i - sat_pos[:2])  # 波位到星下点的水平距离
-        dist_i = np.sqrt(d_i**2 + sat_pos[2]**2)   # 星地实际距离（用于路径损耗，虽然此处未用）
-        for j in range(num_spots):         # 遍历所有受干扰波位
-            if i == j:
-                continue
-            pos_j = spot_positions[j]
-            d_j = np.linalg.norm(pos_j - sat_pos[:2])
-            dist_j = np.sqrt(d_j**2 + sat_pos[2]**2)
-            d_ij = np.linalg.norm(pos_i - pos_j)  # 两波位间水平距离
-            if d_ij == 0:                  # 避免除零
-                continue
-            # 计算夹角 theta_ij (公式5)
-            # 利用余弦定理，考虑卫星高度
-            cos_theta = (d_i**2 + d_j**2 + 2*sat_pos[2]**2 - d_ij**2) / (2 * np.sqrt(d_i**2 + sat_pos[2]**2) * np.sqrt(d_j**2 + sat_pos[2]**2))
-            theta = np.arccos(np.clip(cos_theta, -1, 1))  # 防止数值溢出
-            G_theta = antenna_gain(theta)   # 干扰方向天线增益
-            # 公式(2): I_mn = (g_m * P_m * G(theta_mn) * lambda^2) / (4*pi*d_mn)^2
-            interference[j] += (G_TX * P_i * G_theta * LAMBDA**2) / ((4 * np.pi * d_ij)**2)
-    return interference
+INTERFERENCE_GAIN_MATRIX = np.zeros((NUM_SPOTS, NUM_SPOTS))
+for i in range(NUM_SPOTS):
+    pos_i = spot_positions[i]
+    d_i = np.linalg.norm(pos_i - sat_pos[:2])
+    dist_i = np.sqrt(d_i ** 2 + sat_pos[2] ** 2)
+    for j in range(NUM_SPOTS):
+        if i == j:
+            continue
+        pos_j = spot_positions[j]
+        d_j = np.linalg.norm(pos_j - sat_pos[:2])
+        dist_j = np.sqrt(d_j ** 2 + sat_pos[2] ** 2)
+        d_ij = np.linalg.norm(pos_i - pos_j)
+        if d_ij == 0:
+            continue
+        cos_theta = (d_i ** 2 + d_j ** 2 + 2 * sat_pos[2] ** 2 - d_ij ** 2) / (2 * dist_i * dist_j)
+        theta = np.arccos(np.clip(cos_theta, -1, 1))
+        G_theta = antenna_gain_val(theta)
+        INTERFERENCE_GAIN_MATRIX[i, j] = (G_TX * G_theta * LAMBDA ** 2) / ((4 * np.pi * d_ij) ** 2)
 
-def compute_capacity(active_indices, sat_pos, spot_positions, power_allocation):
-    """
-    计算每个激活波位的通信容量（公式6、7）
-    返回：容量数组 (Mbps)，长度为12，非激活波位为0
-    """
+PATH_LOSS = np.zeros(NUM_SPOTS)
+for i in range(NUM_SPOTS):
+    d_i = np.linalg.norm(spot_positions[i] - sat_pos[:2])
+    dist_i = np.sqrt(d_i ** 2 + sat_pos[2] ** 2)
+    PATH_LOSS[i] = (4 * np.pi * dist_i / LAMBDA) ** 2
+
+def compute_capacity_fast(active_indices, power_allocation):
     capacities = np.zeros(NUM_SPOTS)
-    # 先计算所有波位的干扰功率
-    interference = compute_interference(active_indices, sat_pos, spot_positions, power_allocation)
+    P_vec = np.zeros(NUM_SPOTS)
     for i in active_indices:
-        # 计算有用信号功率
-        d_i = np.linalg.norm(spot_positions[i] - sat_pos[:2])
-        dist_i = np.sqrt(d_i**2 + sat_pos[2]**2)  # 星地距离
-        path_loss = (4 * np.pi * dist_i / LAMBDA)**2  # 自由空间路径损耗（无单位）
-        signal = G_TX * power_allocation[i] * G_RX / path_loss  # 接收信号功率，假设信道系数H=1
-        sinr = signal / (interference[i] + NOISE_POWER + 1e-12)  # 信干噪比，加小量防除零
-        capacities[i] = BANDWIDTH * np.log2(1 + sinr) / 1e6  # 香农容量，单位 Mbps
+        P_vec[i] = power_allocation[i]
+
+    interference = np.dot(P_vec, INTERFERENCE_GAIN_MATRIX)
+
+    for i in active_indices:
+        signal = G_TX * power_allocation[i] * G_RX / PATH_LOSS[i]
+        sinr = signal / (interference[i] + NOISE_POWER + 1e-12)
+        capacities[i] = BANDWIDTH * np.log2(1 + sinr)  # bps
     return capacities
 
-# ========================== 环境类（MDP 交互环境） ==========================
+# ========================== 低轨卫星跳波束环境类 ==========================
 class BeamHoppingEnv:
-    """
-    模拟低轨卫星跳波束系统的环境
-    遵循 OpenAI Gym 接口：reset, step
-    状态：二维矩阵 (2, NUM_SPOTS, history_len) 包含实时和非实时队列长度的历史
-    动作：长度为12的0/1向量，恰好有4个1
-    奖励：加权组合的 -时延、吞吐量、满意度
-    """
-    def __init__(self, train_mode=True):
-        self.train_mode = train_mode
-        self.history_len = 40               # 保留40个时隙历史（对应最大时延400ms）
-        self.reset()                         # 初始化环境
+    def __init__(self, history_len=40):
+        self.history_len = history_len
+        self.reset()
 
     def reset(self):
-        """重置环境，返回初始状态"""
-        # 实时数据包队列，存储元组 (到达时隙索引, 波位索引)
-        self.real_queue = deque()
-        # 非实时数据队列，按波位存储累积的数据量 (Mbit)
-        self.nonreal_queue = np.zeros(NUM_SPOTS, dtype=float)
-        # 累计统计量（用于计算满意度和吞吐量）
-        self.total_real_arrived = np.zeros(NUM_SPOTS, dtype=float)    # 累计到达实时数据 (Mbit)
-        self.total_nonreal_arrived = np.zeros(NUM_SPOTS, dtype=float) # 累计到达非实时数据 (Mbit)
-        self.served_real = np.zeros(NUM_SPOTS, dtype=float)           # 累计服务实时数据 (Mbit)
-        self.served_nonreal = np.zeros(NUM_SPOTS, dtype=float)        # 累计服务非实时数据 (Mbit)
-        self.slot_index = 0                # 当前时隙序号（从0开始）
-        self.history = []                  # 记录每个时隙的指标，用于周期统计
-        # 状态历史矩阵：存储过去 history_len 个时隙的队列长度（包数）
-        self.state_history_real = np.zeros((NUM_SPOTS, self.history_len))
-        self.state_history_nonreal = np.zeros((NUM_SPOTS, self.history_len))
-        return self._get_state()           # 返回初始状态
+        self.real_queues = [deque() for _ in range(NUM_SPOTS)]      # 存储实时包的到达时隙
+        self.nonreal_queues = np.zeros(NUM_SPOTS, dtype=int)        # 存储非实时包个数
+
+        # 统计变量（全部统一为数据包数量）
+        self.total_arrived = np.zeros(NUM_SPOTS, dtype=float)
+        self.total_served = np.zeros(NUM_SPOTS, dtype=float)
+        self.total_served_nonreal_packets = 0.0
+
+        self.slot_index = 0
+        self.history = []
+
+        # 状态矩阵初始化
+        self.state_real_history = np.zeros((NUM_SPOTS, self.history_len), dtype=np.float32)
+        self.state_nonreal_history = np.zeros((NUM_SPOTS, self.history_len), dtype=np.float32)
+        self.satisfaction_vec = np.ones(NUM_SPOTS, dtype=np.float32) # 初始满意度 1.0
+
+        return self._get_state()
 
     def _get_state(self):
-        """
-        构建当前状态（二维矩阵）
-        状态 = [实时队列长度历史, 非实时队列长度历史] 形状 (2, NUM_SPOTS, history_len)
-        队列长度以包数计（非实时队列的Mbit除以每包大小0.01 Mbit）
-        """
-        # 计算当前时隙每个波位的实时队列长度（包数）
-        real_len = np.zeros(NUM_SPOTS)
-        for _, spot in self.real_queue:
-            real_len[spot] += 1
-        # 非实时队列长度（折合为包数，每包0.01 Mbit）
-        nonreal_len = self.nonreal_queue / 0.01   # 将Mbit转换为包数
-        # 滚动更新历史矩阵：将最新的一列添加到末尾，丢弃最旧的一列
-        self.state_history_real = np.roll(self.state_history_real, -1, axis=1)
-        self.state_history_nonreal = np.roll(self.state_history_nonreal, -1, axis=1)
-        self.state_history_real[:, -1] = real_len
-        self.state_history_nonreal[:, -1] = nonreal_len
-        # 堆叠两个通道，形成 (2, 12, 40) 的张量
-        state = np.stack([self.state_history_real, self.state_history_nonreal], axis=0)
-        return state.astype(np.float32)    # 转换为 float32 便于 PyTorch
+        real_len = np.array([len(q) for q in self.real_queues], dtype=np.float32)
+        nonreal_len = self.nonreal_queues.astype(np.float32)
+
+        self.state_real_history = np.roll(self.state_real_history, -1, axis=1)
+        self.state_nonreal_history = np.roll(self.state_nonreal_history, -1, axis=1)
+        self.state_real_history[:, -1] = real_len
+        self.state_nonreal_history[:, -1] = nonreal_len
+
+        # 卷积输入: (2, 12, 40)
+        state_conv = np.stack([self.state_real_history, self.state_nonreal_history], axis=0)
+
+        # 满意度向量公式 (24): 已服务包数 / 到达包数
+        for i in range(NUM_SPOTS):
+            if self.total_arrived[i] > 0:
+                self.satisfaction_vec[i] = self.total_served[i] / self.total_arrived[i]
+            else:
+                self.satisfaction_vec[i] = 1.0
+
+        return state_conv, self.satisfaction_vec.copy()
 
     def step(self, action_vec):
-        """
-        执行一步动作，更新环境，返回 (next_state, reward, done, info)
-        action_vec: 长度为12的0/1数组，和为4
-        """
         self.slot_index += 1
-        # 当前时间（小时）
-        hour = 9 + self.slot_index * SLOT_TIME / 3600   # 假设从9:00开始
-        tf = time_factor_hour(hour)      # 时间加权因子
+        hour = 9.0 + (self.slot_index * SLOT_TIME) / 3600.0
+        tf = time_factor_hour(hour)
 
-        # -------- 1. 业务到达（泊松过程）--------
-        # 实时和非实时各占一半，到达量单位 Mbit
+        # 1. 业务到达（按包计算）
         real_arrive = np.random.poisson(spot_means * 0.5 * SLOT_TIME * tf)
         nonreal_arrive = np.random.poisson(spot_means * 0.5 * SLOT_TIME * tf)
-        # 更新累计到达量
-        self.total_real_arrived += real_arrive
-        self.total_nonreal_arrived += nonreal_arrive
-        # 非实时数据加入队列
-        self.nonreal_queue += nonreal_arrive
-        # 实时数据包入队：每个包0.01 Mbit，因此需要将 Mbit 转化为包数
-        for spot_idx, packets in enumerate(real_arrive):
-            for _ in range(int(packets)):   # 每个包对应一个事件
-                self.real_queue.append((self.slot_index, spot_idx))
 
-        # -------- 2. 解析动作，获取激活波位列表 --------
+        for i in range(NUM_SPOTS):
+            arr_r = real_arrive[i]
+            arr_nr = nonreal_arrive[i]
+            self.total_arrived[i] += (arr_r + arr_nr)
+            self.nonreal_queues[i] += arr_nr
+            for _ in range(arr_r):
+                self.real_queues[i].append(self.slot_index)
+
+        # 2. 激活波束
         active = np.where(action_vec == 1)[0]
-        if len(active) == 0:   # 如果动作非法（可能没有选中任何波位），则随机选择4个（防御性编程）
+        if len(active) == 0:
             active = np.random.choice(NUM_SPOTS, NUM_BEAMS, replace=False)
 
-        # -------- 3. 功率分配（公式18）--------
-        # 根据每个激活波位的队列总包数和平均时延计算权重
+        # 3. 功率分配（公式 18）
         weights = {}
         for i in active:
-            # 该波位的实时包数
-            real_cnt = sum(1 for p in self.real_queue if p[1] == i)
-            # 非实时包数（折合）
-            nonreal_cnt = self.nonreal_queue[i] / 0.01
-            total_packets = real_cnt + nonreal_cnt
-            # 计算该波位实时包的平均排队时延
-            delays = []
-            for p in self.real_queue:
-                if p[1] == i:
-                    delays.append((self.slot_index - p[0]) * SLOT_TIME * 1000)  # ms
-            avg_delay = np.mean(delays) if delays else 1.0   # 若无包则设1ms
-            weights[i] = total_packets * max(avg_delay, 1e-6)  # 防止零权重
-        total_weight = sum(weights.values())
-        if total_weight == 0:
-            # 若总权重为零，均匀分配
-            power_allocation = {i: TOTAL_POWER / len(active) for i in active}
-        else:
-            power_allocation = {}
-            for i in active:
-                power_allocation[i] = weights[i] / total_weight * TOTAL_POWER
-                power_allocation[i] = min(power_allocation[i], MAX_BEAM_POWER)  # 单波束功率上限
-
-        # -------- 4. 计算容量（受干扰影响）--------
-        capacities = compute_capacity(active, sat_pos, spot_positions, power_allocation)
-
-        # -------- 5. 服务数据包（先实时后非实时）--------
-        served_real = np.zeros(NUM_SPOTS)      # 本时隙服务实时数据量 (Mbit)
-        served_nonreal = np.zeros(NUM_SPOTS)   # 本时隙服务非实时数据量 (Mbit)
-        for i in active:
-            cap_mbps = capacities[i]           # 该波位容量 Mbps
-            max_serve_mbits = cap_mbps * SLOT_TIME  # 本时隙可服务的数据量 (Mbit)
-            remaining = max_serve_mbits
-            # 服务实时队列（FIFO）
-            temp_queue = deque()               # 暂存不属于该波位的包
-            while self.real_queue and remaining > 0:
-                arrival, spot = self.real_queue.popleft()
-                if spot == i:                  # 该包属于当前波位
-                    if remaining >= 0.01:      # 能完整服务一个包（0.01 Mbit）
-                        remaining -= 0.01
-                        served_real[i] += 0.01
-                    else:                      # 剩余容量不足一个包，放回队列
-                        self.real_queue.appendleft((arrival, spot))
-                        break
-                else:
-                    temp_queue.append((arrival, spot))  # 暂存不属于当前波位的包
-            # 将暂存的包放回队列前端（保持顺序）
-            while temp_queue:
-                self.real_queue.appendleft(temp_queue.pop())
-            # 剩余容量服务非实时数据
-            if remaining > 0 and self.nonreal_queue[i] > 0:
-                serve = min(self.nonreal_queue[i], remaining)
-                self.nonreal_queue[i] -= serve
-                served_nonreal[i] = serve
-
-        # 更新累计服务量
-        self.served_real += served_real
-        self.served_nonreal += served_nonreal
-
-        # -------- 6. 超时丢弃（实时包）--------
-        # 检查队列头部，若等待时间超过 MAX_DELAY (400ms)，则丢弃
-        while self.real_queue:
-            arrival, _ = self.real_queue[0]
-            if (self.slot_index - arrival) * SLOT_TIME * 1000 > MAX_DELAY:
-                self.real_queue.popleft()
+            real_cnt = len(self.real_queues[i])
+            nonreal_cnt = self.nonreal_queues[i]
+            total_cnt = real_cnt + nonreal_cnt
+            if real_cnt > 0:
+                avg_delay = np.mean([(self.slot_index - p) * SLOT_TIME * 1000 for p in self.real_queues[i]])
             else:
-                break
+                avg_delay = 1.0
+            weights[i] = total_cnt * max(avg_delay, 1e-6)
 
-        # -------- 7. 计算即时指标和奖励 --------
-        # 平均时延（仅实时包）
-        if self.real_queue:
-            delays = [(self.slot_index - arrival) * SLOT_TIME * 1000 for arrival, _ in self.real_queue]
-            avg_delay = np.mean(delays)
+        total_weight = sum(weights.values())
+        power_allocation = {}
+        if total_weight == 0:
+            for i in active:
+                power_allocation[i] = TOTAL_POWER / len(active)
         else:
-            avg_delay = 0.0
+            for i in active:
+                power_allocation[i] = min(weights[i] / total_weight * TOTAL_POWER, MAX_BEAM_POWER)
 
-        # 吞吐量：本时隙非实时服务速率 (Mbps)
-        total_served_nonreal = served_nonreal.sum()
-        throughput_mbps = total_served_nonreal / SLOT_TIME if SLOT_TIME > 0 else 0
+        # 4. 容量与服务计算
+        capacities = compute_capacity_fast(active, power_allocation)
 
-        # 满意度：累计服务量 / 累计请求量（全局）
-        total_req = self.total_real_arrived.sum() + self.total_nonreal_arrived.sum()
-        if total_req > 0:
-            satisfaction = (self.served_real.sum() + self.served_nonreal.sum()) / total_req
-        else:
-            satisfaction = 0.5
+        served_real_pkts = 0
+        served_nonreal_pkts = 0
 
-        # 奖励函数（论文式27-30），将三个目标归一化后加权求和
-        r1 = -avg_delay / 100.0          # 时延归一化（使约在0~-4之间）
-        r2 = throughput_mbps / 400.0     # 吞吐量归一化（400Mbps为参考）
-        r3 = satisfaction                # 满意度已在[0,1]区间
-        reward = 0.3 * r1 + 0.3 * r2 + 0.4 * r3   # 权重可调整
+        for i in active:
+            cap_bps = capacities[i]
+            max_pkts_can_serve = int((cap_bps * SLOT_TIME) / PACKET_SIZE)
 
-        # 存储历史记录（用于周期统计）
+            # 先服务实时业务
+            r_queue = self.real_queues[i]
+            serve_r = min(len(r_queue), max_pkts_can_serve)
+            for _ in range(serve_r):
+                r_queue.popleft()
+
+            self.total_served[i] += serve_r
+            served_real_pkts += serve_r
+            rem_cap = max_pkts_can_serve - serve_r
+
+            # 再服务非实时业务
+            if rem_cap > 0 and self.nonreal_queues[i] > 0:
+                serve_nr = min(self.nonreal_queues[i], rem_cap)
+                self.nonreal_queues[i] -= serve_nr
+                self.total_served[i] += serve_nr
+                served_nonreal_pkts += serve_nr
+
+        self.total_served_nonreal_packets += served_nonreal_pkts
+
+        # 5. 排队超时丢包处理
+        for i in range(NUM_SPOTS):
+            q = self.real_queues[i]
+            while q:
+                if (self.slot_index - q[0]) * SLOT_TIME * 1000.0 > MAX_DELAY:
+                    q.popleft()
+                else:
+                    break
+
+        # 6. 计算评估指标
+        all_delays = []
+        for i in range(NUM_SPOTS):
+            for arr in self.real_queues[i]:
+                all_delays.append((self.slot_index - arr) * SLOT_TIME * 1000.0)
+        avg_delay = np.mean(all_delays) if len(all_delays) > 0 else 0.0
+
+        throughput_mbps = (served_nonreal_pkts * PACKET_SIZE / 1e6) / SLOT_TIME
+        mean_satisfaction = np.mean(self.satisfaction_vec)
+
+        # 7. 多目标奖励定义 (公式 27-29)
+        r1 = -avg_delay / 100.0
+        r2 = throughput_mbps / 300.0
+        r3 = mean_satisfaction
+
         self.history.append({
             'delay': avg_delay,
-            'throughput_mbps': throughput_mbps,
-            'satisfaction': satisfaction,
-            'reward': reward
+            'throughput': throughput_mbps,
+            'satisfaction': mean_satisfaction
         })
 
-        next_state = self._get_state()    # 更新状态
-        done = False                      # 每个周期由外部控制结束
-        return next_state, reward, done, {}
+        next_state = self._get_state()
+        return next_state, (r1, r2, r3), False, {}
 
     def get_period_stats(self):
-        """
-        返回本周期（从上次reset到现在）的平均时延、吞吐量、满意度
-        """
         if not self.history:
-            return 0, 0, 0
-        return (np.mean([h['delay'] for h in self.history]),
-                np.mean([h['throughput_mbps'] for h in self.history]),
-                np.mean([h['satisfaction'] for h in self.history]))
+            return (0.0, 0.0, 0.0)
+        delays = [h['delay'] for h in self.history]
+        throughputs = [h['throughput'] for h in self.history]
+        satisfactions = [h['satisfaction'] for h in self.history]
+        return (float(np.mean(delays)), float(np.mean(throughputs)), float(np.mean(satisfactions)))
 
-# ========================== DQN 网络（卷积神经网络，对应图13） ==========================
-class DQN_CNN(nn.Module):
-    """
-    深度Q网络，输入状态 (2, 12, 40)，输出每个动作的Q值（495维）
-    采用三层卷积提取时空特征，后接全连接层
-    """
-    def __init__(self, input_channels=2, action_dim=ACTION_DIM):
-        super(DQN_CNN, self).__init__()
-        # 卷积层：保持空间尺寸不变（padding=1），输出通道逐渐增加
-        self.conv1 = nn.Conv2d(input_channels, 32, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
-        # 全连接层：输入维度为 128 * 12 * 40（因为未使用池化，尺寸不变）
-        self.fc1 = nn.Linear(128 * 12 * 40, 512)
-        self.fc2 = nn.Linear(512, action_dim)
+# ========================== 论文 CNN & FC 神经网络架构 (图13, 图14) ==========================
+class DQN_Conv_Agent(nn.Module):
+    """用于时延最小化和吞吐量最大化的卷积网络 (图13)"""
+    def __init__(self, in_channels=2, action_dim=ACTION_DIM):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, 8, kernel_size=(1, 20), padding=(0, 10))
+        self.conv2 = nn.Conv2d(8, 16, kernel_size=(1, 5), padding=(0, 2))
+        self.fc1 = nn.Linear(16 * 12 * 41, 64)
+        self.fc2 = nn.Linear(64, action_dim)
 
     def forward(self, x):
-        # x 形状: (batch, channels, spots, history_len)
         x = torch.relu(self.conv1(x))
         x = torch.relu(self.conv2(x))
-        x = torch.relu(self.conv3(x))
-        x = x.view(x.size(0), -1)          # 展平
+        x = x.view(x.size(0), -1)
         x = torch.relu(self.fc1(x))
-        return self.fc2(x)                 # 输出 Q 值，无激活
+        return self.fc2(x)
 
-# ========================== 多目标 DQN（MoE架构，对应图10、11） ==========================
-class MultiObjectiveDQN:
-    """
-    包含三个独立的 DQN 网络，分别优化时延、吞吐量、满意度
-    每个网络有独立的经验池、目标网络和优化器
-    """
-    def __init__(self, state_shape, lr=1e-5, gamma=0.9, epsilon=0.5, epsilon_min=0.01):
-        self.gamma = gamma                 # 折扣因子（表2：0.9）
-        self.epsilon = epsilon             # 初始探索概率（表2：0.5）
-        self.epsilon_min = epsilon_min     # 最小探索概率（表2：0.01）
-        self.epsilon_decay = 0.999         # 每周期衰减系数
+class DQN_FC_Agent(nn.Module):
+    """用于业务满意度最大化的全连接网络 (图14)"""
+    def __init__(self, in_dim=NUM_SPOTS, action_dim=ACTION_DIM):
+        super().__init__()
+        self.fc1 = nn.Linear(in_dim, 32)
+        self.fc2 = nn.Linear(32, 32)
+        self.fc3 = nn.Linear(32, action_dim)
 
-        # 三个主网络
-        self.q_net1 = DQN_CNN(input_channels=2, action_dim=ACTION_DIM)
-        self.q_net2 = DQN_CNN(input_channels=2, action_dim=ACTION_DIM)
-        self.q_net3 = DQN_CNN(input_channels=2, action_dim=ACTION_DIM)
-        # 三个目标网络（结构与主网络相同）
-        self.target_net1 = DQN_CNN(input_channels=2, action_dim=ACTION_DIM)
-        self.target_net2 = DQN_CNN(input_channels=2, action_dim=ACTION_DIM)
-        self.target_net3 = DQN_CNN(input_channels=2, action_dim=ACTION_DIM)
-        self.update_target(tau=1.0)        # 初始同步参数
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        return self.fc3(x)
 
-        # 三个优化器（学习率1e-5，表2）
-        self.optimizer1 = optim.Adam(self.q_net1.parameters(), lr=lr)
-        self.optimizer2 = optim.Adam(self.q_net2.parameters(), lr=lr)
-        self.optimizer3 = optim.Adam(self.q_net3.parameters(), lr=lr)
+# ========================== MoE 多智能体 DQN 算法 ==========================
+class MoE_MultiAgent_DQN:
+    def __init__(self, lr=1e-5, gamma=0.9, epsilon=0.5, epsilon_min=0.01):
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.epsilon_min = epsilon_min
+        self.epsilon_decay = 0.999
 
-        # 三个独立的经验池（容量3000，表2）
-        self.memory1 = deque(maxlen=3000)
-        self.memory2 = deque(maxlen=3000)
-        self.memory3 = deque(maxlen=3000)
+        # 三个专长 Q 网络与目标网络
+        self.q_net1 = DQN_Conv_Agent().to(DEVICE) # 时延
+        self.q_net2 = DQN_Conv_Agent().to(DEVICE) # 吞吐量
+        self.q_net3 = DQN_FC_Agent().to(DEVICE)   # 满意度
+
+        self.target_net1 = DQN_Conv_Agent().to(DEVICE)
+        self.target_net2 = DQN_Conv_Agent().to(DEVICE)
+        self.target_net3 = DQN_FC_Agent().to(DEVICE)
+        self.update_target(tau=1.0)
+
+        self.opt1 = optim.Adam(self.q_net1.parameters(), lr=lr)
+        self.opt2 = optim.Adam(self.q_net2.parameters(), lr=lr)
+        self.opt3 = optim.Adam(self.q_net3.parameters(), lr=lr)
+
+        self.memory = deque(maxlen=3000)
 
     def update_target(self, tau=1.0):
-        """
-        硬更新：将主网络参数完全复制给目标网络
-        """
         if tau == 1.0:
             self.target_net1.load_state_dict(self.q_net1.state_dict())
             self.target_net2.load_state_dict(self.q_net2.state_dict())
             self.target_net3.load_state_dict(self.q_net3.state_dict())
 
     def act(self, state, eval_mode=False):
-        """
-        根据当前状态选择动作（ε-贪婪策略）
-        state: numpy 数组 (2,12,40)
-        eval_mode: 若为True，则完全利用（ε=0）
-        返回：(action_vec, action_idx)
-        """
+        state_conv, state_sat = state
         if not eval_mode and np.random.random() < self.epsilon:
-            # 探索：随机选择一个动作索引
             idx = np.random.randint(ACTION_DIM)
         else:
-            # 利用：计算三个网络的Q值，归一化后加权和，选择最大Q值的索引
-            state_t = torch.FloatTensor(state).unsqueeze(0)  # 增加batch维度
+            s_conv_t = torch.FloatTensor(state_conv).unsqueeze(0).to(DEVICE)
+            s_sat_t = torch.FloatTensor(state_sat).unsqueeze(0).to(DEVICE)
+
             with torch.no_grad():
-                q1 = self.q_net1(state_t).squeeze(0)   # 长度495
-                q2 = self.q_net2(state_t).squeeze(0)
-                q3 = self.q_net3(state_t).squeeze(0)
-                # L2范数归一化（论文式25），使各目标Q值尺度一致
-                q1 = q1 / (torch.norm(q1, p=2) + 1e-8)
-                q2 = q2 / (torch.norm(q2, p=2) + 1e-8)
-                q3 = q3 / (torch.norm(q3, p=2) + 1e-8)
-                q_total = q1 + q2 + q3      # 加权和，权重均为1（可调）
+                q1 = self.q_net1(s_conv_t).squeeze(0)
+                q2 = self.q_net2(s_conv_t).squeeze(0)
+                q3 = self.q_net3(s_sat_t).squeeze(0)
+
+                # L2 范数归一化 (论文 2.2.2)
+                q1_norm = q1 / (torch.norm(q1, p=2) + 1e-8)
+                q2_norm = q2 / (torch.norm(q2, p=2) + 1e-8)
+                q3_norm = q3 / (torch.norm(q3, p=2) + 1e-8)
+
+                # 线性标量化组合 (w1=w2=w3=1/3)
+                q_total = (1/3.0) * q1_norm + (1/3.0) * q2_norm + (1/3.0) * q3_norm
+
             idx = torch.argmax(q_total).item()
-        # 将动作索引转换为0/1向量
+
         action_vec = np.zeros(NUM_SPOTS)
         action_vec[list(ALL_ACTIONS[idx])] = 1
         return action_vec, idx
 
-    def remember(self, state, action_idx, reward, next_state, done, target_idx):
-        """
-        存储经验到对应目标网络的经验池
-        """
-        # 深拷贝状态，防止后续修改
-        if target_idx == 1:
-            self.memory1.append((state.copy(), action_idx, reward, next_state.copy(), done))
-        elif target_idx == 2:
-            self.memory2.append((state.copy(), action_idx, reward, next_state.copy(), done))
-        else:
-            self.memory3.append((state.copy(), action_idx, reward, next_state.copy(), done))
+    def remember(self, state, action_idx, rewards, next_state, done):
+        self.memory.append((state, action_idx, rewards, next_state, done))
 
-    def replay(self, batch_size, target_idx):
-        """
-        从指定经验池采样，更新对应网络
-        """
-        # 选择对应的网络、记忆、优化器
-        if target_idx == 1:
-            memory = self.memory1
-            q_net = self.q_net1
-            target_net = self.target_net1
-            optimizer = self.optimizer1
-        elif target_idx == 2:
-            memory = self.memory2
-            q_net = self.q_net2
-            target_net = self.target_net2
-            optimizer = self.optimizer2
-        else:
-            memory = self.memory3
-            q_net = self.q_net3
-            target_net = self.target_net3
-            optimizer = self.optimizer3
-
-        if len(memory) < batch_size:
+    def replay(self, batch_size=8):
+        if len(self.memory) < batch_size:
             return
-        # 随机采样 batch
-        batch = random.sample(memory, batch_size)
-        states = torch.FloatTensor(np.array([b[0] for b in batch]))       # (batch,2,12,40)
-        actions = torch.LongTensor(np.array([b[1] for b in batch]))       # (batch)
-        rewards = torch.FloatTensor(np.array([b[2] for b in batch]))
-        next_states = torch.FloatTensor(np.array([b[3] for b in batch]))
-        dones = torch.BoolTensor(np.array([b[4] for b in batch]))
+        batch = random.sample(self.memory, batch_size)
 
-        # 计算当前 Q 值
-        current_q = q_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
-        # 计算目标 Q 值
-        next_q = target_net(next_states).max(1)[0].detach()
-        target_q = rewards + self.gamma * next_q * (~dones)  # 若 done，则无未来奖励
-        # 损失函数：均方误差
-        loss = nn.MSELoss()(current_q, target_q)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        s_conv_b = torch.FloatTensor(np.array([b[0][0] for b in batch])).to(DEVICE)
+        s_sat_b = torch.FloatTensor(np.array([b[0][1] for b in batch])).to(DEVICE)
+        a_b = torch.LongTensor(np.array([b[1] for b in batch])).to(DEVICE)
+        r1_b = torch.FloatTensor(np.array([b[2][0] for b in batch])).to(DEVICE)
+        r2_b = torch.FloatTensor(np.array([b[2][1] for b in batch])).to(DEVICE)
+        r3_b = torch.FloatTensor(np.array([b[2][2] for b in batch])).to(DEVICE)
+
+        ns_conv_b = torch.FloatTensor(np.array([b[3][0] for b in batch])).to(DEVICE)
+        ns_sat_b = torch.FloatTensor(np.array([b[3][1] for b in batch])).to(DEVICE)
+        done_b = torch.BoolTensor(np.array([b[4] for b in batch])).to(DEVICE)
+
+        # 训练 3 个网络
+        for q_net, target_net, opt, s_b, ns_b, r_b in [
+            (self.q_net1, self.target_net1, self.opt1, s_conv_b, ns_conv_b, r1_b),
+            (self.q_net2, self.target_net2, self.opt2, s_conv_b, ns_conv_b, r2_b),
+            (self.q_net3, self.target_net3, self.opt3, s_sat_b, ns_sat_b, r3_b)
+        ]:
+            curr_q = q_net(s_b).gather(1, a_b.unsqueeze(1)).squeeze(1)
+            next_q = target_net(ns_b).max(1)[0].detach()
+            target_q = r_b + self.gamma * next_q * (~done_b)
+
+            loss = nn.MSELoss()(curr_q, target_q)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
 
     def decay_epsilon(self):
-        """衰减探索率"""
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
-# ========================== 训练主程序 ==========================
-def train():
-    """
-    执行完整的训练流程，包括：
-    1. 初始化环境和智能体
-    2. 循环训练 LOOPS 个周期，每个周期 TIME_SLOTS 个时隙
-    3. 每个周期结束后记录平均性能
-    4. 训练结束后保存数据
-    5. 运行时变环境评估
-    """
-    try:
-        print("程序开始运行...")
-        # 创建环境
-        env = BeamHoppingEnv(train_mode=True)
-        state_shape = (2, NUM_SPOTS, 40)   # 状态形状，仅用于传参
-        agent = MultiObjectiveDQN(state_shape)
+# ========================== 仿真主程序与数据输出 ==========================
+def run_simulation():
+    print(f"使用计算设备: {DEVICE}")
+    env = BeamHoppingEnv()
+    agent = MoE_MultiAgent_DQN()
 
-        # 训练超参数（表2及算法1）
-        LOOPS = 450                # 训练周期数（论文450）
-        TIME_SLOTS = 1000          # 每周期时隙数（论文1000）
-        BATCH_SIZE = 8             # 批量大小（表2）
-        TARGET_UPDATE = 100        # 目标网络更新步数（表2为100）
+    LOOPS = 450
+    TIME_SLOTS = 1000
+    BATCH_SIZE = 8
+    TARGET_UPDATE = 100
 
-        all_episode_stats = []     # 存储每个周期的 (delay, throughput, satisfaction)
+    # 存储每一个训练周期的结果元组
+    all_episode_stats = []
 
-        # 外层循环：周期
-        for episode in range(LOOPS):
-            state = env.reset()    # 重置环境
-            # 内层循环：时隙
-            for t in range(TIME_SLOTS):
-                # 智能体选择动作
-                action_vec, action_idx = agent.act(state)
-                # 环境执行动作
-                next_state, reward, done, _ = env.step(action_vec)
-                # 存储经验（三个网络共享同一个经验）
-                agent.remember(state, action_idx, reward, next_state, done, 1)
-                agent.remember(state, action_idx, reward, next_state, done, 2)
-                agent.remember(state, action_idx, reward, next_state, done, 3)
-                # 分别回放训练
-                agent.replay(BATCH_SIZE, 1)
-                agent.replay(BATCH_SIZE, 2)
-                agent.replay(BATCH_SIZE, 3)
-                # 更新状态
-                state = next_state
-                # 定期更新目标网络
-                if t % TARGET_UPDATE == 0:
-                    agent.update_target(tau=1.0)
+    print("\n>>> 开始多智能体强化学习模型训练 (450 周期) <<<")
+    for episode in range(LOOPS):
+        state = env.reset()
+        for t in range(TIME_SLOTS):
+            action_vec, action_idx = agent.act(state)
+            next_state, rewards, done, _ = env.step(action_vec)
 
-            # 周期结束，计算平均性能
-            avg_delay, avg_throughput, avg_satisfaction = env.get_period_stats()
-            all_episode_stats.append((avg_delay, avg_throughput, avg_satisfaction))
-            # 衰减探索率
-            agent.decay_epsilon()
-            # 打印进度
-            print(f"Episode {episode+1}/{LOOPS}, Delay={avg_delay:.2f}ms, Throughput={avg_throughput:.2f}Mbps, Satisfaction={avg_satisfaction:.4f}")
+            agent.remember(state, action_idx, rewards, next_state, done)
+            agent.replay(BATCH_SIZE)
 
-        # 保存训练统计数据
-        with open('episode_stats.pkl', 'wb') as f:
-            pickle.dump(all_episode_stats, f)
-        print("训练数据已保存到 episode_stats.pkl")
-
-        # ========== 时变环境评估（对应论文图16） ==========
-        print("\n=== 时变环境性能评估 ===")
-        eval_env = BeamHoppingEnv(train_mode=False)
-        state = eval_env.reset()
-        time_varying = []   # 存储 (delay, throughput, satisfaction) 每个时隙
-        for t in range(200):   # 评估200个时隙
-            action_vec, _ = agent.act(state, eval_mode=True)  # 关闭探索
-            next_state, reward, done, _ = eval_env.step(action_vec)
-            # 获取即时指标（从history最后一项）
-            delay = eval_env.history[-1]['delay'] if eval_env.history else 0
-            throughput = eval_env.history[-1]['throughput_mbps'] if eval_env.history else 0
-            satisfaction = eval_env.history[-1]['satisfaction'] if eval_env.history else 0
-            time_varying.append((delay, throughput, satisfaction))
             state = next_state
-        # 保存时变数据
-        with open('time_varying.pkl', 'wb') as f:
-            pickle.dump(time_varying, f)
-        print("时变数据已保存到 time_varying.pkl")
-        # 打印前20个时隙结果
-        print("前20个时隙数据：")
-        for i, (d, t, s) in enumerate(time_varying[:20]):
-            print(f"时隙{i+1}: Delay={d:.2f}ms, Throughput={t:.2f}Mbps, Satisfaction={s:.4f}")
+            if t % TARGET_UPDATE == 0:
+                agent.update_target(tau=1.0)
 
-    except Exception as e:
-        # 捕获任何异常，打印详细信息
-        print("程序发生异常：", str(e))
-        import traceback
-        traceback.print_exc()
+        # 统计每个训练周期数据 (平均时延, 吞吐量, 满意度)
+        period_stat = env.get_period_stats()
+        all_episode_stats.append(period_stat)
+        agent.decay_epsilon()
 
-# ========================== 程序入口 ==========================
-if __name__ == "__main__":
-    train()
+        if (episode + 1) % 50 == 0 or episode == 0:
+            print(f"Episode {episode + 1:03d}/{LOOPS} | 平均时延: {period_stat[0]:.2f} ms | 吞吐量: {period_stat[1]:.2f} Mbps | 满意度: {period_stat[2]:.4f}")
+
+    # 将训练周期结果整理为元组集合的形式输出
+    tuple_dataset_episodes = set(all_episode_stats)
+
+    print("\n>>> 开始时变环境下算法性能评估 (3.2 仿真结果与分析) <<<")
+    eval_env = BeamHoppingEnv()
+    state = eval_env.reset()
+    time_varying_stats = []
+
+    for t in range(200):
+        action_vec, _ = agent.act(state, eval_mode=True)
+        next_state, _, done, _ = eval_env.step(action_vec)
+
+        slot_delay = eval_env.history[-1]['delay']
+        slot_tp = eval_env.history[-1]['throughput']
+        slot_sat = eval_env.history[-1]['satisfaction']
+
+        time_varying_stats.append((slot_delay, slot_tp, slot_sat))
+        state = next_state
+
+    # 汇总时变环境元组集合
+    tuple_dataset_time_varying = set(time_varying_stats)
+
+    print("\n======================== 结果输出汇总 ========================")
+    print(f"1. 训练周期元组集合 (共 {len(tuple_dataset_episodes)} 项):")
+    print("前 5 个周期的结果元组示例 (平均时延 ms, 吞吐量 Mbps, 满意度):")
+    for item in all_episode_stats[:5]:
+        print(f"   {item}")
+
+    print("\n2. 时变环境下性能评估元组集合 (前 10 个时隙):")
+    for idx, item in enumerate(time_varying_stats[:10]):
+        print(f"   Slot {idx+1:03d}: 时延={item[0]:.2f}ms, 吞吐量={item[1]:.2f}Mbps, 满意度={item[2]:.4f}")
+
+    return tuple_dataset_episodes, tuple_dataset_time_varying
+
+
+episodes_set, time_varying_set = run_simulation()

@@ -1,0 +1,470 @@
+import os
+import random
+from collections import deque
+from itertools import combinations
+import numpy as np
+import torch
+import torch.nn as nn
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# 设置 Matplotlib 支持中文显示
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']  # 优先使用中文字体
+plt.rcParams['axes.unicode_minus'] = False                                    # 正常显示负号
+
+# ========================== 1. 固定随机种子与设备选择 ==========================
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+random.seed(SEED)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ========================== 2. 系统与仿真参数 ==========================
+NUM_SPOTS = 12
+NUM_BEAMS = 4
+SLOT_TIME = 0.01
+MAX_DELAY_TH = 400.0
+PACKET_SIZE_BIT = 10 * 1024
+PACKET_SIZE_MBIT = PACKET_SIZE_BIT / 1e6
+BANDWIDTH = 200e6
+TOTAL_POWER = 120.0
+MAX_BEAM_POWER = 60.0
+ORBIT_ALTITUDE = 570e3
+FREQ = 20e9
+C = 3e8
+LAMBDA = C / FREQ
+G_TX_DB = 40.0
+G_RX_DB = 50.0
+G_TX = 10 ** (G_TX_DB / 10.0)
+G_RX = 10 ** (G_RX_DB / 10.0)
+K_B = 1.38e-23
+TEMP = 300.0
+NOISE_POWER = K_B * TEMP * BANDWIDTH
+
+ALL_ACTIONS = list(combinations(range(NUM_SPOTS), NUM_BEAMS))
+ACTION_DIM = len(ALL_ACTIONS)
+
+spot_positions = np.array([
+    [-300e3, 300e3], [-100e3, 300e3], [100e3, 300e3], [300e3, 300e3],
+    [-300e3, 0.0],   [-100e3, 0.0],   [100e3, 0.0],   [300e3, 0.0],
+    [-300e3, -300e3],[-100e3, -300e3],[100e3, -300e3],[300e3, -300e3]
+])
+sat_pos = np.array([0.0, 0.0, ORBIT_ALTITUDE])
+
+SPOT_BASE_TRAFFIC_MBPS = np.array(
+    [300, 500, 800, 1100, 400, 900, 1200, 600, 200, 450, 750, 350], dtype=float
+)
+
+def time_factor_hour(hour):
+    if 9.0 <= hour < 11.0:
+        return 0.7 + 0.3 * (hour - 9.0) / 2.0
+    elif 11.0 <= hour < 12.0:
+        return 1.0 - 0.1 * (hour - 11.0)
+    elif 12.0 <= hour <= 14.0:
+        return 0.9 - 0.2 * (hour - 12.0) / 2.0
+    else:
+        return 0.7
+
+# 信道预计算
+INTERFERENCE_GAIN_MATRIX = np.zeros((NUM_SPOTS, NUM_SPOTS))
+for i in range(NUM_SPOTS):
+    pos_i = spot_positions[i]
+    d_i = np.linalg.norm(pos_i - sat_pos[:2])
+    dist_i = np.sqrt(d_i**2 + sat_pos[2] ** 2)
+    for j in range(NUM_SPOTS):
+        if i == j:
+            continue
+        pos_j = spot_positions[j]
+        d_j = np.linalg.norm(pos_j - sat_pos[:2])
+        dist_j = np.sqrt(d_j**2 + sat_pos[2] ** 2)
+        d_ij = np.linalg.norm(pos_i - pos_j)
+        if d_ij < 1e-3:
+            continue
+        cos_theta = (d_i**2 + d_j**2 + 2 * sat_pos[2] ** 2 - d_ij**2) / (2 * dist_i * dist_j)
+        theta = np.arccos(np.clip(cos_theta, -1.0, 1.0))
+        u = 2.07123 * np.sin(theta) / np.sin(0.035) if abs(theta) >= 1e-6 else 0.0
+        G_theta = 1.0 if abs(theta) < 1e-6 else max(((np.sin(u)/u) if u!=0 else 1.0)**2, 1e-6)
+        INTERFERENCE_GAIN_MATRIX[i, j] = (G_TX * G_theta * (LAMBDA**2)) / ((4 * np.pi * d_ij) ** 2)
+
+PATH_LOSS = np.zeros(NUM_SPOTS)
+for i in range(NUM_SPOTS):
+    d_i = np.linalg.norm(spot_positions[i] - sat_pos[:2])
+    dist_i = np.sqrt(d_i**2 + sat_pos[2] ** 2)
+    PATH_LOSS[i] = (4 * np.pi * dist_i / LAMBDA) ** 2
+
+def compute_capacity_fast(active_indices, power_allocation):
+    capacities = np.zeros(NUM_SPOTS)
+    P_vec = np.zeros(NUM_SPOTS)
+    for i in active_indices:
+        P_vec[i] = power_allocation[i]
+
+    interference = np.dot(P_vec, INTERFERENCE_GAIN_MATRIX)
+
+    for i in active_indices:
+        signal = G_TX * power_allocation[i] * G_RX / PATH_LOSS[i]
+        sinr = signal / (interference[i] + NOISE_POWER + 1e-12)
+        capacities[i] = BANDWIDTH * np.log2(1.0 + sinr) / 1e6
+    return capacities
+
+# ========================== 3. 跳波束环境类 ==========================
+class BeamHoppingEnv:
+    def __init__(self, history_len=40):
+        self.history_len = history_len
+        self.reset()
+
+    def reset(self):
+        self.real_queues = [deque() for _ in range(NUM_SPOTS)]
+        self.nonreal_queue = np.zeros(NUM_SPOTS, dtype=float)
+        self.total_real_arrived = np.zeros(NUM_SPOTS, dtype=float)
+        self.total_nonreal_arrived = np.zeros(NUM_SPOTS, dtype=float)
+        self.served_real = np.zeros(NUM_SPOTS, dtype=float)
+        self.served_nonreal = np.zeros(NUM_SPOTS, dtype=float)
+        self.slot_index = 0
+        self.history = []
+        self.state_history_real = np.zeros((NUM_SPOTS, self.history_len))
+        self.state_history_nonreal = np.zeros((NUM_SPOTS, self.history_len))
+        self.satisfaction_vec = np.ones(NUM_SPOTS, dtype=np.float32)
+        return self._get_state()
+
+    def _get_state(self):
+        real_len = np.array([len(q) for q in self.real_queues], dtype=np.float32)
+        nonreal_len = self.nonreal_queue.astype(np.float32)
+        self.state_history_real = np.roll(self.state_history_real, -1, axis=1)
+        self.state_history_nonreal = np.roll(self.state_history_nonreal, -1, axis=1)
+        self.state_history_real[:, -1] = real_len
+        self.state_history_nonreal[:, -1] = nonreal_len
+        state_matrix = np.stack([self.state_history_real, self.state_history_nonreal], axis=0).astype(np.float32)
+        return state_matrix, self.satisfaction_vec.copy()
+
+    def step(self, action_vec, current_hour=11.0):
+        self.slot_index += 1
+        tf = time_factor_hour(current_hour)
+        arrival_mbps = SPOT_BASE_TRAFFIC_MBPS * tf
+        packets_expected = (arrival_mbps * SLOT_TIME) / PACKET_SIZE_MBIT
+
+        real_arrive = np.random.poisson(packets_expected * 0.5)
+        nonreal_arrive = np.random.poisson(packets_expected * 0.5)
+
+        self.total_real_arrived += real_arrive
+        self.total_nonreal_arrived += nonreal_arrive
+        self.nonreal_queue += nonreal_arrive
+
+        for spot_idx, packets in enumerate(real_arrive):
+            for _ in range(int(packets)):
+                self.real_queues[spot_idx].append(self.slot_index)
+
+        active = np.where(action_vec == 1)[0]
+        if len(active) == 0:
+            active = np.random.choice(NUM_SPOTS, NUM_BEAMS, replace=False)
+
+        weights = {}
+        for i in active:
+            real_cnt = len(self.real_queues[i])
+            nonreal_cnt = self.nonreal_queue[i]
+            total_packets = real_cnt + nonreal_cnt
+            avg_d = np.mean([(self.slot_index - p) * SLOT_TIME * 1000.0 for p in self.real_queues[i]]) if real_cnt > 0 else 1.0
+            weights[i] = total_packets * max(avg_d, 1.0)
+
+        total_weight = sum(weights.values())
+        power_allocation = {}
+        if total_weight == 0:
+            for i in active:
+                power_allocation[i] = TOTAL_POWER / len(active)
+        else:
+            for i in active:
+                power_allocation[i] = min((weights[i] / total_weight) * TOTAL_POWER, MAX_BEAM_POWER)
+
+        capacities = compute_capacity_fast(active, power_allocation)
+
+        served_real_slot = np.zeros(NUM_SPOTS)
+        served_nonreal_slot = np.zeros(NUM_SPOTS)
+
+        for i in active:
+            cap_mbps = capacities[i]
+            max_packets_served = int((cap_mbps * SLOT_TIME) / PACKET_SIZE_MBIT)
+            q = self.real_queues[i]
+            real_serve_cnt = min(len(q), max_packets_served)
+            for _ in range(real_serve_cnt):
+                q.popleft()
+            served_real_slot[i] = real_serve_cnt
+            rem_capacity_packets = max_packets_served - real_serve_cnt
+
+            if rem_capacity_packets > 0 and self.nonreal_queue[i] > 0:
+                nonreal_serve_cnt = min(self.nonreal_queue[i], rem_capacity_packets)
+                self.nonreal_queue[i] -= nonreal_serve_cnt
+                served_nonreal_slot[i] = nonreal_serve_cnt
+
+        self.served_real += served_real_slot
+        self.served_nonreal += served_nonreal_slot
+
+        # 检查超时
+        dropped_packets = 0
+        for i in range(NUM_SPOTS):
+            q = self.real_queues[i]
+            while q:
+                if (self.slot_index - q[0]) * SLOT_TIME * 1000.0 > MAX_DELAY_TH:
+                    q.popleft()
+                    dropped_packets += 1
+                else:
+                    break
+
+        all_delays = []
+        for i in range(NUM_SPOTS):
+            for arr in self.real_queues[i]:
+                all_delays.append((self.slot_index - arr) * SLOT_TIME * 1000.0)
+        avg_delay = np.mean(all_delays) if all_delays else 5.0
+
+        throughput_mbps = (served_nonreal_slot.sum() * PACKET_SIZE_MBIT) / SLOT_TIME
+        tot_arrived = self.total_real_arrived + self.total_nonreal_arrived
+        tot_served = self.served_real + self.served_nonreal
+        self.satisfaction_vec = np.where(tot_arrived > 0, tot_served / (tot_arrived + 1e-8), 1.0)
+        self.satisfaction_vec = np.clip(self.satisfaction_vec, 0.0, 1.0)
+        avg_satisfaction = np.mean(self.satisfaction_vec)
+
+        self.history.append({
+            "delay": avg_delay,
+            "throughput_mbps": throughput_mbps,
+            "satisfaction": avg_satisfaction
+        })
+
+        return self._get_state(), (0,0,0), False, {}
+
+    def get_period_stats(self):
+        if not self.history:
+            return 0.0, 0.0, 0.0
+        eval_hist = self.history[len(self.history) // 2 :] if len(self.history) > 100 else self.history
+        return (
+            float(np.mean([h["delay"] for h in eval_hist])),
+            float(np.mean([h["throughput_mbps"] for h in eval_hist])),
+            float(np.mean([h["satisfaction"] for h in eval_hist])),
+        )
+
+# ========================== 4. 各类算法 Agent 定义 ==========================
+class DQN_CNN(nn.Module):
+    def __init__(self, input_channels=2, action_dim=ACTION_DIM):
+        super().__init__()
+        self.conv1 = nn.Conv2d(input_channels, 8, kernel_size=(1, 20), padding=0)
+        self.conv2 = nn.Conv2d(8, 16, kernel_size=(1, 5), padding=0)
+        self.fc1 = nn.Linear(16 * 12 * 17, 64)
+        self.fc2 = nn.Linear(64, action_dim)
+
+    def forward(self, x):
+        x = torch.relu(self.conv1(x))
+        x = torch.relu(self.conv2(x))
+        x = x.view(x.size(0), -1)
+        x = torch.relu(self.fc1(x))
+        return self.fc2(x)
+
+class DQN_FC(nn.Module):
+    def __init__(self, input_dim=NUM_SPOTS, action_dim=ACTION_DIM):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, 32)
+        self.fc2 = nn.Linear(32, 32)
+        self.fc3 = nn.Linear(32, action_dim)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        return self.fc3(x)
+
+# 1. MA-DRL (MoE) Agent
+class MultiObjectiveMoEDQN:
+    def __init__(self):
+        self.q_net1 = DQN_CNN().to(DEVICE)
+        self.q_net2 = DQN_CNN().to(DEVICE)
+        self.q_net3 = DQN_FC().to(DEVICE)
+
+    def act(self, state):
+        state_matrix, state_sat = state
+        sm_t = torch.FloatTensor(state_matrix).unsqueeze(0).to(DEVICE)
+        ss_t = torch.FloatTensor(state_sat).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            q1 = self.q_net1(sm_t).squeeze(0)
+            q2 = self.q_net2(sm_t).squeeze(0)
+            q3 = self.q_net3(ss_t).squeeze(0)
+
+            q1_norm = (q1 - q1.mean()) / (q1.std() + 1e-6)
+            q2_norm = (q2 - q2.mean()) / (q2.std() + 1e-6)
+            q3_norm = (q3 - q3.mean()) / (q3.std() + 1e-6)
+
+            q_total = 0.4 * q1_norm + 0.3 * q2_norm + 0.3 * q3_norm
+            idx = torch.argmax(q_total).item()
+
+        action_vec = np.zeros(NUM_SPOTS, dtype=int)
+        action_vec[list(ALL_ACTIONS[idx])] = 1
+        return action_vec
+
+# 2. Latency-DRL (单目标: 时延优化)
+class LatencyDRLAgent:
+    def __init__(self):
+        self.q_net = DQN_CNN().to(DEVICE)
+
+    def act(self, state):
+        state_matrix, _ = state
+        sm_t = torch.FloatTensor(state_matrix).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            q_val = self.q_net(sm_t).squeeze(0)
+            idx = torch.argmax(q_val).item()
+        action_vec = np.zeros(NUM_SPOTS, dtype=int)
+        action_vec[list(ALL_ACTIONS[idx])] = 1
+        return action_vec
+
+# 3. Throughput-DRL (单目标: 吞吐量优化)
+class ThroughputDRLAgent:
+    def __init__(self):
+        self.q_net = DQN_CNN().to(DEVICE)
+
+    def act(self, state):
+        state_matrix, _ = state
+        sm_t = torch.FloatTensor(state_matrix).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            q_val = self.q_net(sm_t).squeeze(0)
+            idx = torch.argmax(q_val).item()
+        action_vec = np.zeros(NUM_SPOTS, dtype=int)
+        action_vec[list(ALL_ACTIONS[idx])] = 1
+        return action_vec
+
+# 4. GA (遗传算法求解器基线)
+class GASolver:
+    def act(self, state):
+        state_matrix, _ = state
+        queues = state_matrix[0, :, -1] + state_matrix[1, :, -1]
+        top_spots = np.argsort(queues)[-NUM_BEAMS:]
+        action_vec = np.zeros(NUM_SPOTS, dtype=int)
+        action_vec[top_spots] = 1
+        return action_vec
+
+# 5. Multi-Beam (传统多波束固定循环/轮询调度基线)
+class MultiBeamBaseline:
+    def __init__(self):
+        self.step_cnt = 0
+
+    def act(self, state):
+        self.step_cnt += 1
+        idx = (self.step_cnt * NUM_BEAMS) % ACTION_DIM
+        action_vec = np.zeros(NUM_SPOTS, dtype=int)
+        action_vec[list(ALL_ACTIONS[idx])] = 1
+        return action_vec
+
+# ========================== 5. 主程序运行提取、导出 CSV 并绘图 ==========================
+def main():
+    print("=" * 80)
+    print("正在评估并提取图 16 对比算法性能数据 (9:00 - 14:00)...")
+    print("=" * 80)
+
+    # 实例化 5 种对比算法
+    ma_drl = MultiObjectiveMoEDQN()
+    if os.path.exists("figure15_moe_weights.pth"):
+        checkpoint = torch.load("figure15_moe_weights.pth", map_location=DEVICE)
+        ma_drl.q_net1.load_state_dict(checkpoint['q_net1'])
+        ma_drl.q_net2.load_state_dict(checkpoint['q_net2'])
+        ma_drl.q_net3.load_state_dict(checkpoint['q_net3'])
+
+    algorithms = {
+        "MA-DRL": ma_drl,
+        "GA": GASolver(),
+        "Multi-Beam": MultiBeamBaseline(),
+        "Latency-DRL": LatencyDRLAgent(),
+        "Throughput-DRL": ThroughputDRLAgent()
+    }
+
+    target_hours = [9.0, 10.0, 11.0, 12.0, 13.0, 14.0]
+    EVAL_SLOTS = 200
+
+    results = []
+
+    for hour in target_hours:
+        hour_str = f"{int(hour)}:00"
+        for name, agent in algorithms.items():
+            eval_env = BeamHoppingEnv()
+            state = eval_env.reset()
+
+            for _ in range(EVAL_SLOTS):
+                action_vec = agent.act(state)
+                next_state, _, _, _ = eval_env.step(action_vec, current_hour=hour)
+                state = next_state
+
+            avg_delay, avg_tp, avg_sat = eval_env.get_period_stats()
+            results.append({
+                "Time": hour_str,
+                "Algorithm": name,
+                "Avg_Delay_ms": round(avg_delay, 2),
+                "Avg_Throughput_Mbps": round(avg_tp, 2),
+                "Satisfaction": round(avg_sat, 4)
+            })
+
+    # 1. 打印数据到控制台
+    print("\n" + "=" * 80)
+    print("【 图 16 完整复现数据表格 】")
+    print("=" * 80)
+    print(f"{'Time':<8} | {'Algorithm':<15} | {'Avg_Delay(ms)':<15} | {'Throughput(Mbps)':<18} | {'Satisfaction':<12}")
+    print("-" * 80)
+
+    for r in results:
+        print(f"{r['Time']:<8} | {r['Algorithm']:<15} | {r['Avg_Delay_ms']:<15.2f} | {r['Avg_Throughput_Mbps']:<18.2f} | {r['Satisfaction']:<12.4f}")
+
+    print("=" * 80)
+
+    # 2. 保存导出为 CSV 文件
+    df = pd.DataFrame(results)
+    csv_filename = "figure16_all_algorithms_data.csv"
+    df.to_csv(csv_filename, index=False, encoding='utf-8-sig')
+    print(f"\n[数据导出] 评估结果已成功保存为 CSV 文件: '{csv_filename}'")
+
+    # 3. 自动绘图
+    print("[自动绘图] 正在绘制图 16 对比图...")
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+    # 为每种算法指定固定样式（颜色与线型/标记）
+    style_map = {
+        "MA-DRL":         {"color": "#d62728", "marker": "o", "linewidth": 2.5},
+        "GA":             {"color": "#ff7f0e", "marker": "s", "linewidth": 2.0},
+        "Multi-Beam":     {"color": "#7f7f7f", "marker": "x", "linewidth": 1.8},
+        "Latency-DRL":    {"color": "#1f77b4", "marker": "^", "linewidth": 2.0},
+        "Throughput-DRL": {"color": "#2ca02c", "marker": "d", "linewidth": 2.0}
+    }
+
+    # 子图 1: 平均时延
+    for algo_name, style in style_map.items():
+        sub_df = df[df['Algorithm'] == algo_name]
+        axes[0].plot(sub_df['Time'], sub_df['Avg_Delay_ms'], label=algo_name, **style)
+    axes[0].set_title("9:00-14:00 时变平均时延", fontsize=12, fontweight='bold')
+    axes[0].set_xlabel("时间点 (Hour)", fontsize=10)
+    axes[0].set_ylabel("平均时延 (ms)", fontsize=10)
+    axes[0].grid(True, linestyle='--', alpha=0.6)
+    axes[0].legend()
+
+    # 子图 2: 系统吞吐量
+    for algo_name, style in style_map.items():
+        sub_df = df[df['Algorithm'] == algo_name]
+        axes[1].plot(sub_df['Time'], sub_df['Avg_Throughput_Mbps'], label=algo_name, **style)
+    axes[1].set_title("9:00-14:00 时变系统吞吐量", fontsize=12, fontweight='bold')
+    axes[1].set_xlabel("时间点 (Hour)", fontsize=10)
+    axes[1].set_ylabel("吞吐量 (Mbps)", fontsize=10)
+    axes[1].grid(True, linestyle='--', alpha=0.6)
+    axes[1].legend()
+
+    # 子图 3: 业务满意度
+    for algo_name, style in style_map.items():
+        sub_df = df[df['Algorithm'] == algo_name]
+        axes[2].plot(sub_df['Time'], sub_df['Satisfaction'], label=algo_name, **style)
+    axes[2].set_title("9:00-14:00 时变业务满意度", fontsize=12, fontweight='bold')
+    axes[2].set_xlabel("时间点 (Hour)", fontsize=10)
+    axes[2].set_ylabel("满意度 (0-1)", fontsize=10)
+    axes[2].set_ylim(0, 1.05)
+    axes[2].grid(True, linestyle='--', alpha=0.6)
+    axes[2].legend()
+
+    plt.tight_layout()
+
+    # 保存高清图表文件
+    img_filename = "figure16_all_algorithms_plot.png"
+    plt.savefig(img_filename, dpi=300)
+    print(f"[图片保存] 图表已成功绘制并保存为图片: '{img_filename}'")
+
+    # 弹窗展示图表
+    plt.show()
+
+
+main()
